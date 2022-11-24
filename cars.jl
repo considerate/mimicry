@@ -1,5 +1,3 @@
-
-
 # run with julia -i [filename.jl]
 #
 # or julia -i if that doesn't work (it will be slower to start)
@@ -144,7 +142,7 @@ function plot_arena()
         color=nothing,
     )
     # holes in a shape aren't plotted so we fake it by plotting them in white
-    for coords in coordinates(arenaShape)[2:end]
+    for coords in LibGEOS.GeoInterface.coordinates(arenaShape)[2:end]
         inner = LibGEOS.Polygon([coords])
         # plot!(inner,color="white")
         plot!(inner,color=nothing)
@@ -304,7 +302,7 @@ function l2(net::Network)
 end
 
 
-# note: currently sample and loss both run meanslogvars - the 
+# note: currently sample and loss both run meanslogvars - the
 # activations of the hidden layer are calculated twice, as I don't
 # know how to store them - fixing this is a possible optimisation.
 
@@ -315,7 +313,7 @@ function sample(net::Network, inputs::Vector{Float64})
 end
 function loss(net::Network, inputs::Vector{Float64}, outputs::Vector{Float64})
     # inputs of size n1, outputs of size n3.
-    # for the moment only a single data point is supported, since that's how 
+    # for the moment only a single data point is supported, since that's how
     # it will be run in the lineage learning algorithm
     means, logvars = meanslogvars(net, inputs)
     logvars = max.(logvars,min_logvar)
@@ -497,8 +495,8 @@ function main(run_once = false)
         println(population[1].feedback_nodes)
         if run_once
             break
-        end    
-    end    
+        end
+    end
 end
 
 if profiling
