@@ -30,6 +30,7 @@ using Zygote
 using Plots
 using LibGEOS, GeoInterface
 using Profile
+using DataStructures
 
 import Flux
 
@@ -43,14 +44,6 @@ const tau=2*pi
 profiling = false
 
 # agent parameters
-
-# const sensorParams = [
-#     (0.4,-0.025*tau),
-#     (0.2,-0.15*tau),
-#     (0.5,0.0),
-#     (0.2,0.15*tau),
-#     (0.4,0.025*tau),
-# ];
 
 const sensorParams = [
     (d, a*tau)
@@ -274,11 +267,6 @@ function relu(x)
 end
 
 function meanslogvars(net::Network, inputs::Vector{Float64})
-    # println(net.layer1_w)
-    # println(inputs)
-    # println(net.layer1_w * inputs)
-    # println(net.layer1_b)
-    # println()
     layer1_activations = relu.(net.layer1_w * inputs + net.layer1_b)
     means = net.mean_w * layer1_activations + net.mean_b
     logvars = net.logvar_w * layer1_activations + net.logvar_b
@@ -366,10 +354,6 @@ function update!(
     grads = network_gradient(net, inputs, outputs)
     for name in fieldnames(Network)
         field = getfield(net, name)
-        # println(name)
-        # println(field)
-        # println(grads[field])
-        # println()
         setfield!(net, name, field - lrate*grads[field])
     end
 end
@@ -397,24 +381,35 @@ function alive(agent::Agent)
     return onTrack(agent.body)
 end
 
+function step(agent::Agent)
+    # possible future (micro-)optimisation: this currently updates the network
+    # even if the agent hit the edge - that could be avoided
+    sensors = sensorValues(agent.body)
+    inputs = [sensors; agent.feedback_nodes*1.0]
+    outputs = sample(agent.network, inputs)
+
+    output = outputs[1]
+    if isnan(output)
+        # we take a zero-tolerance approach to NaNs here - if you output one
+        # you are immediately teleported outside the arena and die.
+        agent.body = AgentBody(-1000.0,-1000.0,0.0)
+        output = 0
+    end
+    feedback = outputs[2:end]
+    agent.feedback_nodes = (
+        agent.feedback_nodes.*(1.0 .- 1.0./mem_decay_times)
+        + feedback.*(1.0./mem_decay_times)
+    )
+    agent.body = moveForward(turn(agent.body,output))
+    return output
+end
+
 function update(agent::Agent)
     # possible future (micro-)optimisation: this currently updates the network
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body)
-#    println(sensors)
-    # inputs = [sensors; tanh.(agent.feedback_nodes*0.1)]
     inputs = [sensors; agent.feedback_nodes*1.0]
-#    println(inputs)
     outputs = sample(agent.network, inputs)
-    # println(outputs)
-
-    # diagnostics
-    # m,lv = meanslogvars(agent.network, inputs)
-    # println([m[1], lv[1], sqrt(exp(lv[1]))])
-    # println(outputs[1])
-
-#    update!(agent.network, inputs, outputs, learning_rate)
-
     grads = network_gradient(agent.network, inputs, outputs)
     for name in fieldnames(Network)
         Flux.update!(
@@ -436,8 +431,64 @@ function update(agent::Agent)
         agent.feedback_nodes.*(1.0 .- 1.0./mem_decay_times)
         + feedback.*(1.0./mem_decay_times)
     )
-    # agent.feedback_nodes = feedback
     agent.body = moveForward(turn(agent.body,output))
+    return output
+end
+
+function mimic_loss(net::Network, inputs::Vector{Float64},outputs::Vector{Float64}, target::Float64)
+    means, logvars = meanslogvars(net, inputs)
+    logvars = max.(logvars,min_logvar)
+    squared_deviation = ((means[1]-outputs[1]) - target) ^ 2
+    gaussian_loss = 0.5*sum(squared_deviation * exp(-logvars[1]) + logvars[1])
+    return gaussian_loss #+ 0.01*l2(net)
+end
+
+function mimicry_gradient(
+        net::Network,
+        inputs::Vector{Float64},
+        outputs::Vector{Float64},
+        target::Float64,
+    )
+    return gradient(
+        () -> mimic_loss(net, inputs, outputs, target),
+        Params([
+            getfield(net,name)
+            for name in fieldnames(Network)
+        ])
+    )
+end
+
+# train an agent to mimic the outputs in a chronological trajectory of some other agent
+function mimic(agent::Agent, trajectory::Array{Tuple{AgentBody,Float64}})
+    if size(trajectory)[1] == 0
+        return
+    end
+    original_feedback = copy(agent.feedback_nodes)
+    (last_body, last_turning) = pop!(trajectory)
+    # replay trajectory
+    for (body, _) in trajectory
+        sensors = sensorValues(body)
+        inputs = [sensors; agent.feedback_nodes*1.0]
+        outputs = sample(agent.network, inputs)
+        feedback = outputs[2:end]
+        agent.feedback_nodes = (
+            agent.feedback_nodes.*(1.0 .- 1.0./mem_decay_times)
+            + feedback.*(1.0./mem_decay_times)
+        )
+    end
+    sensors = sensorValues(last_body)
+    inputs = [sensors; agent.feedback_nodes*1.0]
+    outputs = sample(agent.network, inputs)
+    # train on last step of trajectory
+    grads = mimicry_gradient(agent.network, inputs, outputs, last_turning)
+    for name in fieldnames(Network)
+        Flux.update!(
+            agent.optimiser,
+            getfield(agent.network, name),
+            grads[getfield(agent.network,name)]
+        )
+    end
+    agent.feedback_nodes = original_feedback
 end
 
 function pretty_print(a::Agent)
@@ -452,11 +503,21 @@ end
 
 
 function main(run_once = false)
-    population::Array{Agent} = [Agent() for i in 1:pop_size]
+    Base.exit_on_sigint(true)
+    population::Array{Agent} = [Agent() for _ in 1:pop_size]
+    max_len = 20
+    history = CircularBuffer{Array{Tuple{Int64, AgentBody, Float64}}}(max_len)
+    iteration = 1
+    current::Array{Int64} = [i for i in 1:pop_size]
+    outputs::Array{Float64} = [0.0 for _ in 1:pop_size]
     while true
-        for iter in 1:4
-            for agent in population
-                update(agent)
+        iteration += 1
+        for _ in 1:4
+            outputs = [0.0 for _ in 1:pop_size]
+            current = [i for i in 1:pop_size]
+            for (i, agent) in enumerate(population)
+                outputs[i] = update(agent)
+                # update(agent)
             end
             all_alive = false
             while !all_alive
@@ -466,10 +527,12 @@ function main(run_once = false)
                     # future improvement: this is a fairly dumb way to do things
                     if !alive(population[k])
                         all_alive = false
-                        neighbour = population[mod1(k+rand([-1,1]),pop_size)]
+                        neighbour_index = mod1(k+rand([-1,1]),pop_size)
+                        neighbour = population[neighbour_index]
                         # neighbour = population[rand(1:pop_size)]
                         if alive(neighbour)
                             population[k] = deepcopy(neighbour)
+                            current[k] = neighbour_index
                         end
                     else
                         all_dead = false
@@ -484,14 +547,28 @@ function main(run_once = false)
                 end
             end
         end
+        positions = [agent.body for agent in population]
+        pushfirst!(history, collect(zip(current, positions, outputs)))
+        trajectory:: Array{Tuple{AgentBody, Float64}} = []
+        for agent in population
+            trajectory = []
+            index = rand(1:pop_size)
+            for t in 1:length(history)
+                parent, body, output = history[t][index]
+                pushfirst!(trajectory, (body, output))
+                index = parent
+            end
+            if size(trajectory)[1] > 0
+                mimic(agent, trajectory[1:length(history)÷2])
+            end
+        end
+        GC.gc()
         plt = plot_arena()
         for agent in population
             plot_body!(agent.body)
         end
         plot_sensors!(population[1].body)
         display(plt)
-        # pretty_print(population[1])
-        # println()
         println(population[1].feedback_nodes)
         if run_once
             break

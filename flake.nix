@@ -41,13 +41,13 @@
               pkgs.iana-etc
               pkgs.dbus.lib
               # from davinci
+              pkgs.udev
               pkgs.librsvg
               pkgs.libGLU
               pkgs.libGL
               pkgs.xorg.libICE
               pkgs.xorg.libSM
               pkgs.xorg.libXxf86vm
-              pkgs.udev
               pkgs.opencl-headers
               pkgs.alsa-lib
               pkgs.xorg.libX11
@@ -58,6 +58,8 @@
               pkgs.bzip2
               pkgs.libtool
               pkgs.ocl-icd
+              # dev environment
+              pkgs.neovim
             ];
             multiPkgs = pkgs: (with pkgs;
               [
