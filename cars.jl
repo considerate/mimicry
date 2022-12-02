@@ -461,6 +461,23 @@ end
 
 # Population stuff and main loop
 # ------------------------------
+#
+# parents
+# 1 1 4 1 1
+# 2 2 2 2 2
+# 3 2 3 3 3
+# 4 4 4 4 4
+#
+# 1
+# [1 1 4 4 4]
+#
+# [4 4 4 1 1]
+#      | m
+#
+# 3
+# [3 3 3 2 2]
+# [2 2 3 3 3]
+#      | m
 
 
 function main(run_once = false)
