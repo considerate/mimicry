@@ -41,7 +41,7 @@ const tau=2*pi
 
 # disagnostic parameters
 
-profiling = true
+profiling = false
 
 # agent parameters
 
@@ -297,7 +297,7 @@ end
 
 function loss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vector{Float64})::Float64
     squared_deviations = (outputs-means).^2
-    gaussian_loss = 0.5*sum(squared_deviations .* exp.(-logvars)+ (logvars).^2)
+    gaussian_loss = 0.5*sum(squared_deviations .* exp.(-logvars) + logvars)/length(outputs)
     return gaussian_loss #+ 0.01*l2(net)
 end
 
@@ -306,6 +306,9 @@ function forward(net::Network,inputs:: Vector{Float64})::Tuple{Vector{Float64},V
     logvars = max.(logvars,min_logvar)
     return (means, logvars)
 end
+
+# A -> B
+# A -> B × (dB -> dA)
 
 function train(net::Network, inputs::Vector{Float64})::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}},Any}
     (means, logvars), dforward = Zygote.pullback(forward, net, inputs)
@@ -326,12 +329,12 @@ end
 
 # for testing and initialisation
 function random_network()
-    layer1_w = randn((n2,n1)) * (1.0/n1)
-    layer1_b = randn(n2) * 0
-    mean_w = randn((n3,n2)) * (1.0/n2)
-    mean_b = randn(n3) * 0
-    logvar_w = randn((n3,n2)) * (1.0/n2)
-    logvar_b = randn(n3) * 0
+    layer1_w = randn((n2,n1)) * sqrt(2.0/n1)
+    layer1_b = zeros(n2)
+    mean_w = randn((n3,n2)) * sqrt(2.0/n2)
+    mean_b = zeros(n3)
+    logvar_w = randn((n3,n2))* sqrt(2.0/n2)
+    logvar_b = zeros(n3)
     return Network(
         layer1_w,
         layer1_b,
@@ -475,45 +478,45 @@ function main(run_once = false)
             current[i] = i
         end
         for _ in 1:4
-            # total_loss = 0.0
-            # for (i, agent) in enumerate(population)
-            #     ys = step(agent)
-            #     l = 0.0
-            #     # ys, l = update(agent)
-            #     for (j, y) in enumerate(ys)
-            #         outputs[i, j] = y
-            #     end
-            #     total_loss += l
-            # end
-            # mean_loss = total_loss / pop_size
-            # println(mean_loss)
-            # all_alive = false
-            # while !all_alive
-            #     all_alive = true
-            #     all_dead = true
-            #     for k in 1:length(population)
-            #         # future improvement: this is a fairly dumb way to do things
-            #         if !alive(population[k])
-            #             all_alive = false
-            #             neighbour_index = mod1(k+rand([-1,1]),pop_size)
-            #             neighbour = population[neighbour_index]
-            #             # neighbour = population[rand(1:pop_size)]
-            #             if alive(neighbour)
-            #                 population[k] = deepcopy(neighbour)
-            #                 current[k] = neighbour_index
-            #             end
-            #         else
-            #             all_dead = false
-            #         end
-            #     end
-            #     if all_dead
-            #         for agent in population
-            #             agent.body = randomBody()
-            #         end
-            #         all_dead = false
-            #         all_alive = true
-            #     end
-            # end
+            total_loss = 0.0
+            for (i, agent) in enumerate(population)
+                # ys = step(agent)
+                # l = 0.0
+                ys, l = update(agent)
+                for (j, y) in enumerate(ys)
+                    outputs[i, j] = y
+                end
+                total_loss += l
+            end
+            mean_loss = total_loss / pop_size
+            println(mean_loss)
+            all_alive = false
+            while !all_alive
+                all_alive = true
+                all_dead = true
+                for k in 1:length(population)
+                    # future improvement: this is a fairly dumb way to do things
+                    if !alive(population[k])
+                        all_alive = false
+                        neighbour_index = mod1(k+rand([-1,1]),pop_size)
+                        neighbour = population[neighbour_index]
+                        # neighbour = population[rand(1:pop_size)]
+                        if alive(neighbour)
+                            population[k] = deepcopy(neighbour)
+                            current[k] = neighbour_index
+                        end
+                    else
+                        all_dead = false
+                    end
+                end
+                if all_dead
+                    for agent in population
+                        agent.body = randomBody()
+                    end
+                    all_dead = false
+                    all_alive = true
+                end
+            end
         end
         # for (i, agent) in enumerate(population)
         #     positions[i] = agent.body
@@ -536,7 +539,6 @@ function main(run_once = false)
         #         mimic(agent, trajectory[1:length(history)÷2])
         #     end
         # end
-        # GC.gc()
         plt = plot_arena()
         for agent in population
             plot_body!(agent.body)
