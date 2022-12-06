@@ -38,12 +38,11 @@
               # from davinci
               pkgs.udev
               pkgs.librsvg
-              pkgs.libGLU
-              pkgs.libGL
-              pkgs.xorg.libICE
-              pkgs.xorg.libSM
-              pkgs.xorg.libXxf86vm
-              pkgs.opencl-headers
+              # pkgs.libGLU
+              # pkgs.libGL
+              # pkgs.xorg.libICE
+              # pkgs.xorg.libSM
+              # pkgs.xorg.libXxf86vm
               pkgs.alsa-lib
               pkgs.expat
               pkgs.zlib
@@ -53,6 +52,8 @@
               pkgs.ocl-icd
               # dev environment
               pkgs.neovim
+              # memory
+              pkgs.valgrind
             ];
             multiPkgs = pkgs: (with pkgs;
               [

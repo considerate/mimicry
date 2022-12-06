@@ -349,12 +349,6 @@ end
 # Agent stuff
 # -----------
 
-mutable struct Agent
-    feedback_nodes::Array{Float64} # n_feedback_nodes
-    network::Network
-    body::AgentBody
-    optimiser # Flux optimisers all have different types
-end
 
 function Agent()
     return Agent(
