@@ -991,6 +991,11 @@ git-tree-sha1 = "13237798b407150a6d2e2bce5d793d7d9576e99e"
 uuid = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 version = "0.6.13"
 
+[[deps.TERMIOS]]
+git-tree-sha1 = "658f5aff8f64b475c4b3c3c8da6ab457dd96812b"
+uuid = "10233e3b-0d6c-416a-8c1a-d3d286bd6cd2"
+version = "0.3.0"
+
 [[deps.TOML]]
 deps = ["Dates"]
 uuid = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
