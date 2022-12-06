@@ -48,14 +48,14 @@ function moveForward!(b::Body)
 end
 
 
-function plot_body!(b::Body)
-    poly = LibGEOS.Polygon([[
-                [b.x + 0.05*sin(b.theta), b.y + 0.05*cos(b.theta)],
-                [b.x + 0.015*sin(b.theta + tau/3), b.y + 0.015*cos(b.theta + tau/3)],
-                [b.x + 0.015*sin(b.theta - tau/3), b.y + 0.015*cos(b.theta - tau/3)],
-                [b.x + 0.05*sin(b.theta), b.y + 0.05*cos(b.theta)],
-            ]])
-    Plots.plot!(poly,color="blue",linecolor=nothing)
-end
+# function plot_body!(b::Body)
+#     poly = LibGEOS.Polygon([[
+#                 [b.x + 0.05*sin(b.theta), b.y + 0.05*cos(b.theta)],
+#                 [b.x + 0.015*sin(b.theta + tau/3), b.y + 0.015*cos(b.theta + tau/3)],
+#                 [b.x + 0.015*sin(b.theta - tau/3), b.y + 0.015*cos(b.theta - tau/3)],
+#                 [b.x + 0.05*sin(b.theta), b.y + 0.05*cos(b.theta)],
+#             ]])
+#     Plots.plot!(poly,color="blue",linecolor=nothing)
+# end
 
 end

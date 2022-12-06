@@ -34,7 +34,7 @@ function randomPoint() :: Tuple{Float64, Float64}
 end
 
 function onTrack(x :: Float64, y :: Float64):: Bool
-    return contains(arena, LibGEOS.Point(x,y))
+    return false # contains(arena, LibGEOS.Point(x,y))
 end
 
 # println(LibGEOS.GeoInterface.coordinates(arenaShape))
@@ -60,8 +60,8 @@ function plot_arena()
         arenaShape,
         xlims=(xmin,xmax),
         ylims=(ymin,ymax),
-        axis=([],false),
-        grid=false,
+        # axis=([],false),
+        # grid=false,
         color=nothing,
     )
     # holes in a shape aren't plotted so we fake it by plotting them in white
