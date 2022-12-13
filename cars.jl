@@ -41,7 +41,7 @@ const tau=2*pi
 
 # disagnostic parameters
 
-profiling = false
+profiling = true
 
 # agent parameters
 
@@ -290,15 +290,34 @@ function l2(net::Network)
 end
 
 
-function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64}
+# note: currently sample and loss both run meanslogvars - the
+# activations of the hidden layer are calculated twice, as I don't
+# know how to store them - fixing this is a possible optimisation.
+
+function sample(net::Network, inputs::Vector{Float64})
+    means, logvars = meanslogvars(net, inputs)
     sigma = exp.(logvars*0.5)
     return randn(n3).*sigma + means
 end
 
-function loss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vector{Float64})::Float64
+function sample2(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64}
+    sigma = exp.(logvars*0.5)
+    return randn(n3).*sigma + means
+end
+
+function loss2(means::Vector{Float64},logvars::Vector{Float64},outputs::Vector{Float64})::Float64
     squared_deviations = (outputs-means).^2
-    gaussian_loss = 0.5*sum(squared_deviations .* exp.(-logvars) + logvars)/length(outputs)
+    gaussian_loss = 0.5*sum(squared_deviations .* exp.(-logvars)+ (logvars).^2)
     return gaussian_loss #+ 0.01*l2(net)
+end
+
+function loss(net::Network, inputs::Vector{Float64}, outputs::Vector{Float64})
+    # inputs of size n1, outputs of size n3.
+    # for the moment only a single data point is supported, since that's how
+    # it will be run in the lineage learning algorithm
+    means, logvars = meanslogvars(net, inputs)
+    logvars = max.(logvars,min_logvar)
+    return loss2(means, logvars, outputs)
 end
 
 function forward(net::Network,inputs:: Vector{Float64})::Tuple{Vector{Float64},Vector{Float64}}
@@ -307,34 +326,24 @@ function forward(net::Network,inputs:: Vector{Float64})::Tuple{Vector{Float64},V
     return (means, logvars)
 end
 
-# A -> B
-# A -> B × (dB -> dA)
-
 function train(net::Network, inputs::Vector{Float64})::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}},Any}
     (means, logvars), dforward = Zygote.pullback(forward, net, inputs)
-    outputs = sample(means,logvars)
-    l, dloss = Zygote.pullback(loss, means, logvars, outputs)
+    outputs = sample2(means,logvars)
+    loss, dloss = Zygote.pullback(loss2, means, logvars, outputs)
     (dmean, dlogvars, _) = dloss(1.0)
     (grads, _) = dforward((dmean, dlogvars))
-    return ((l, means, logvars, outputs), Zygote._project(net,grads))
-end
-
-function train_against(net::Network, inputs::Vector{Float64},outputs::Vector{Float64})::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}},Any}
-    (means, logvars), dforward = Zygote.pullback(forward, net, inputs)
-    l, dloss = Zygote.pullback(loss, means, logvars, outputs)
-    (dmean, dlogvars, _) = dloss(1.0)
-    (grads, _) = dforward((dmean, dlogvars))
-    return ((l, means, logvars, outputs), Zygote._project(net,grads))
+    g2 = Zygote._project(net,grads)
+    return ((loss, means, logvars, outputs), g2)
 end
 
 # for testing and initialisation
 function random_network()
-    layer1_w = randn((n2,n1)) * sqrt(2.0/n1)
-    layer1_b = zeros(n2)
-    mean_w = randn((n3,n2)) * sqrt(2.0/n2)
-    mean_b = zeros(n3)
-    logvar_w = randn((n3,n2))* sqrt(2.0/n2)
-    logvar_b = zeros(n3)
+    layer1_w = randn((n2,n1)) * (1.0/n1)
+    layer1_b = randn(n2) * 0
+    mean_w = randn((n3,n2)) * (1.0/n2)
+    mean_b = randn(n3) * 0
+    logvar_w = randn((n3,n2)) * (1.0/n2)
+    logvar_b = randn(n3) * 0
     return Network(
         layer1_w,
         layer1_b,
@@ -345,10 +354,44 @@ function random_network()
     )
 end
 
+function network_gradient(
+        net::Network,
+        inputs::Vector{Float64},
+        outputs::Vector{Float64}
+    )
+    return gradient(
+        () -> loss(net, inputs, outputs),
+        Params([
+            getfield(net,name)
+            for name in fieldnames(Network)
+        ])
+    )
+end
+
+
+# not used any more - see in Agent
+function update!(
+        net::Network,
+        inputs::Vector{Float64},
+        outputs::Vector{Float64},
+        lrate::Float64
+    )
+    grads = network_gradient(net, inputs, outputs)
+    for name in fieldnames(Network)
+        field = getfield(net, name)
+        setfield!(net, name, field - lrate*grads[field])
+    end
+end
 
 # Agent stuff
 # -----------
 
+mutable struct Agent
+    feedback_nodes::Array{Float64} # n_feedback_nodes
+    network::Network
+    body::AgentBody
+    optimiser # Flux optimisers all have different types
+end
 
 function Agent()
     return Agent(
@@ -368,8 +411,7 @@ function step(agent::Agent)
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    (means, logvars) = forward(agent.network, inputs)
-    outputs = sample(means,logvars)
+    outputs = sample(agent.network, inputs)
 
     output = outputs[1]
     if isnan(output)
@@ -384,7 +426,7 @@ function step(agent::Agent)
         + feedback.*(1.0./mem_decay_times)
     )
     agent.body = moveForward(turn(agent.body,output))
-    return outputs
+    return output
 end
 
 function update(agent::Agent)
@@ -412,11 +454,33 @@ function update(agent::Agent)
         + feedback.*(1.0./mem_decay_times)
     )
     agent.body = moveForward(turn(agent.body,output))
-    return (outputs, loss)
+    return (output, loss)
+end
+
+function mimic_loss(net::Network, inputs::Vector{Float64}, target::Float64)
+    means, logvars = meanslogvars(net, inputs)
+    logvars = max.(logvars,min_logvar)
+    squared_deviation = (means[1] - target) ^ 2
+    gaussian_loss = 0.5*sum(squared_deviation * exp(-logvars[1]) + logvars[1])
+    return gaussian_loss #+ 0.01*l2(net)
+end
+
+function mimicry_gradient(
+        net::Network,
+        inputs::Vector{Float64},
+        target::Float64,
+    )
+    return gradient(
+        () -> mimic_loss(net, inputs, target),
+        Params([
+            getfield(net,name)
+            for name in fieldnames(Network)
+        ])
+    )
 end
 
 # train an agent to mimic the outputs in a chronological trajectory of some other agent
-function mimic(agent::Agent, trajectory::Array{Tuple{AgentBody,Vector{Float64}}})
+function mimic(agent::Agent, trajectory::Array{Tuple{AgentBody,Float64}})
     if size(trajectory)[1] == 0
         return
     end
@@ -426,22 +490,26 @@ function mimic(agent::Agent, trajectory::Array{Tuple{AgentBody,Vector{Float64}}}
     for (body, _) in trajectory
         sensors = sensorValues(body)
         inputs = [sensors; agent.feedback_nodes*1.0]
-        (means, logvars) = forward(agent.network, inputs)
-        outputs = sample(means, logvars)
+        outputs = sample(agent.network, inputs)
         feedback = outputs[2:end]
         agent.feedback_nodes = (
             agent.feedback_nodes.*(1.0 .- 1.0./mem_decay_times)
             + feedback.*(1.0./mem_decay_times)
         )
     end
-    # train on last step of trajectory
     sensors = sensorValues(last_body)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    (loss, _, _, _), grads = train_against(agent.network, inputs, last_turning)
+    # train on last step of trajectory
+    grads = mimicry_gradient(agent.network, inputs, last_turning)
     for name in fieldnames(Network)
-        param = getfield(agent.network, name)
-        grad = grads[name] # grads[getfield(agent.network,name)]
-        Flux.update!(agent.optimiser, param, grad)
+        print(name)
+    end
+    for name in fieldnames(Network)
+        Flux.update!(
+            agent.optimiser,
+            getfield(agent.network, name),
+            grads[getfield(agent.network,name)]
+        )
     end
     agent.feedback_nodes = original_feedback
 end
@@ -455,49 +523,27 @@ end
 
 # Population stuff and main loop
 # ------------------------------
-#
-# parents
-# 1 1 4 1 1
-# 2 2 2 2 2
-# 3 2 3 3 3
-# 4 4 4 4 4
-#
-# 1
-# [1 1 4 4 4]
-#
-# [4 4 4 1 1]
-#      | m
-#
-# 3
-# [3 3 3 2 2]
-# [2 2 3 3 3]
-#      | m
 
 
 function main(run_once = false)
     # Base.exit_on_sigint(true)
     population::Array{Agent} = [Agent() for _ in 1:pop_size]
     max_len = 20
-    history = CircularBuffer{Tuple{Array{Int64, 1}, Array{AgentBody, 1}, Array{Float64, 2}}}(max_len)
-    current::Array{Int64} = Array{Int64, 1}(undef, pop_size)
-    outputs = Array{Float64, 2}(undef, pop_size, n3)
-    positions = Array{AgentBody,1}(undef, pop_size)
-    trajectory:: Array{Tuple{AgentBody, Vector{Float64}}} = []
-    output = Vector{Float64}(undef, n3)
+    history = CircularBuffer{Array{Tuple{Int64, AgentBody, Float64}}}(max_len)
+    current::Array{Int64} = [i for i in 1:pop_size]
+    outputs::Array{Float64} = [0.0 for _ in 1:pop_size]
     while true
-        for i in 1:pop_size
-            current[i] = i
-        end
         for _ in 1:4
+            outputs = [0.0 for _ in 1:pop_size]
+            current = [i for i in 1:pop_size]
             total_loss = 0.0
             for (i, agent) in enumerate(population)
-                # ys = step(agent)
-                # l = 0.0
-                ys, l = update(agent)
-                for (j, y) in enumerate(ys)
-                    outputs[i, j] = y
+                outputs[i], loss = update(agent)
+                if isnan(loss)
+                    loss = 8.0 # arbitrary "high" loss
                 end
-                total_loss += l
+                total_loss += loss
+                # update(agent)
             end
             mean_loss = total_loss / pop_size
             println(mean_loss)
@@ -529,27 +575,22 @@ function main(run_once = false)
                 end
             end
         end
-        # for (i, agent) in enumerate(population)
-        #     positions[i] = agent.body
-        # end
-        # pushfirst!(history, (current, positions, outputs))
+        positions = [agent.body for agent in population]
+        pushfirst!(history, collect(zip(current, positions, outputs)))
+        # trajectory:: Array{Tuple{AgentBody, Float64}} = []
         # for agent in population
-        #     empty!(trajectory)
+        #     trajectory = []
         #     index = rand(1:pop_size)
         #     for t in 1:length(history)
-        #         parents, bodies, outs = history[t]
-        #         body = bodies[index]
-        #         parent = parents[index]
-        #         for j in 1:n3
-        #             output[j] = outs[index, j]
-        #         end
+        #         parent, body, output = history[t][index]
         #         pushfirst!(trajectory, (body, output))
         #         index = parent
         #     end
-        #     if length(trajectory) > 0
+        #     if size(trajectory)[1] > 0
         #         mimic(agent, trajectory[1:length(history)÷2])
         #     end
         # end
+        # GC.gc()
         plt = plot_arena()
         for agent in population
             plot_body!(agent.body)

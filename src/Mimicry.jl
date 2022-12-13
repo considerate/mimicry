@@ -19,15 +19,32 @@ function cleanup()
     print("\033[?25h") # show cursor
 end
 
-# NB: The Network doesn't have to be mutable because all the contained Arrays are.
-# TODO: check if we can get this working with MVector and MMatrix from StaticArrays
-mutable struct Network
-    layer1_w::Matrix{Float64}        # n1 -> n2  (n2 x n1)
-    layer1_b::Vector{Float64}        # n2
-    mean_w::Matrix{Float64}          # n2 -> n3  (n3 x n2)
-    mean_b::Vector{Float64}          # n3
-    logvar_w::Matrix{Float64}        # n2 -> n3  (n3 x n2)
-    logvar_b::Vector{Float64}        # n3
+struct ConvNext
+    depthwise :: Flux.Conv
+    norm :: Flux.LayerNorm
+    pointwise :: Flux.Conv
+    conv :: Flux.Conv
+end
+
+# ConvNext block: https://arxiv.org/pdf/2201.03545.pdf
+# TODO: support changing kernel size
+function ConvNext(size::NTuple{N, Integer}, k::NTuple{N, Integer}, ch::Pair{Int64, Int64}, bias=false, σ=Flux.gelu, expand::Int64= 4) where N
+    in = ch.first
+    out = ch.second
+    e = in * expand
+    depthwise = Flux.Conv(k, in => in, bias=bias, pad=Flux.SamePad())
+    norm = Flux.LayerNorm(size)
+    point = ntuple(x -> 1, length(k))
+    pointwise = Flux.Conv(point, in => e, bias=bias)
+    conv = Flux.Conv(point, e => out, bias=bias)
+    return ConvNext(depthwise, norm, pointwise, conv)
+end
+
+function (layer::ConvNext)(input::AbstractArray)
+    return input .+ layer.conv(layer.pointwise(layer.norm(layer.depthwise(input))))
+end
+
+struct Network
 end
 
 struct Sizes
@@ -38,7 +55,7 @@ struct Sizes
     n_feedback_nodes :: Int64
 end
 
-const AgentParams = Tuple{Vector{Polar}, Sizes}
+const AgentParams = Tuple{Matrix{Polar}, Sizes}
 
 struct Body
     x::Float64
@@ -47,7 +64,7 @@ struct Body
 end
 
 mutable struct Agent
-    feedback_nodes::Vector{Float64} # n_feedback_nodes
+    feedback_nodes::Matrix{Float64} # n_feedback_nodes
     network::Network
     body::Body
     optimiser :: Flux.Adam
@@ -72,9 +89,10 @@ end
 
 
 function Agent(learning_rate :: Float64, params :: AgentParams, arena :: Arena)
-    (_, sizes) = params
+    (sensorParams, sizes) = params
+    dims = size(sensorParams)
     return Agent(
-        randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes),
+        randn(dims) * (1.0/sizes.n_feedback_nodes),
         randomnetwork(sizes),
         randomBody(arena),
         Flux.Optimise.Adam(learning_rate)
@@ -91,7 +109,7 @@ function relu(x)
     return max(x, 0)
 end
 
-function network(net :: Network, inputs :: Vector{Float64}) ::Tuple{Vector{Float64},Vector{Float64}}
+function network(net :: Network, inputs :: Matrix{Float64}) ::Tuple{Vector{Float64},Vector{Float64}}
     min_std_deviation = 0.01
     min_logvar = 2*log(min_std_deviation)
     layer1_activations = relu.(net.layer1_w * inputs + net.layer1_b)
@@ -252,7 +270,7 @@ function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64
     return randn(length(means)).*sigma + means
 end
 
-function train(net::Network, inputs::Vector{Float64})::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any}
+function train(net::Network, inputs::Matrix{Float64})::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any}
     (means, logvars), dforward = Zygote.pullback(network, net, inputs)
     outputs = sample(means,logvars)
     loss, dloss = Zygote.pullback(gaussloss, means, logvars, outputs)
@@ -364,30 +382,31 @@ function loop(agents :: Vector{Agent}, arena :: Arena, params :: AgentParams)
     end
 end
 
-function sensorPoints(b::Body, sensorParams :: Vector{Polar}) :: Vector{Point}
+function sensorPoints(b::Body, sensorParams :: Matrix{Polar}) :: Matrix{Point}
     # for a possible future performance optimisation - only check the endpoints
     # are within the arena, not the whole line.
-    function pointFromParams(length,angle)
+    function pointFromParams(p)
+        (length,angle) = p
         x0 = b.x
         y0 = b.y
         x1 = x0 + length*sin(angle + b.theta)
         y1 = y0 + length*cos(angle + b.theta)
         return (x1,y1)
     end
-    return [pointFromParams(length,angle) for (length,angle) in sensorParams]
+    return pointFromParams.(sensorParams)
 end
 
-function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float64}
+function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Matrix{Float64}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
     return [!ontrack(p, arena) for p in points]
 end
 
 function agentparams() :: AgentParams
-    sensorParams :: Vector{Polar} = [
+    sensorParams :: Matrix{Polar} = [
         (d, a*tau)
-        for d in [0.1, 0.2, 0.3, 0.4, 0.5]
-        for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25]
+        for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25],
+            d in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
     ]
     n_feedback_nodes = 10
     n_hidden_nodes = 20
@@ -401,15 +420,17 @@ end
 
 function main()
     atexit(cleanup)
-    arena = createArena()
+    # arena = createArena()
     (_, backup_termios) = disable_echo()
-    params = agentparams()
-    pop_size = 500
-    agents = [Agent(1e-4, params, arena) for _ in 1:pop_size]
-    print("\033[?25l") # hide cursor
+    # params :: AgentParams = agentparams()
+    layer = ConvNext((6,6), (7,7), 1 => 1)
+    println(layer(randn((6,6,1,1)))[:,:,1,1])
+    # pop_size = 500
+    #agents = [Agent(1e-4, params, arena) for _ in 1:pop_size]
+    # print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
     try
-        loop(agents, arena, params)
+        # loop(agents, arena, params)
     catch e
         if isa(e, Core.InterruptException)
             TERMIOS.tcsetattr(stdin, TERMIOS.TCSANOW, backup_termios)

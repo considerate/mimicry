@@ -60,7 +60,9 @@
                 udev
                 alsa-lib
               ]);
-            runScript = "bash --noprofile --norc";
+            runScript = "bash";
+            profile = ''
+            '';
           };
         in
         {

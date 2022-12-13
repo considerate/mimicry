@@ -4,6 +4,7 @@ authors = ["Viktor Kronvall <viktor.kronvall@gmail.com>"]
 version = "0.1.0"
 
 [deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
 LibGEOS = "a90b1aa1-3769-5649-ba7e-abc5a9d163eb"
