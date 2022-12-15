@@ -313,9 +313,7 @@ function replicateagent(source :: Agent, target :: Agent)
 
     target.optimiser.eta = source.optimiser.eta
     target.optimiser.beta = source.optimiser.beta
-    for (k, v) in source.optimiser.state
-        target.optimiser.state[k] = v
-    end
+    target.optimiser.state = IdDict()
 
     target.network.logvar_w[:,:] .= source.network.logvar_w
     target.network.logvar_b[:] .= source.network.logvar_b
