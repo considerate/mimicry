@@ -38,7 +38,7 @@ struct Sizes
     n_feedback_nodes :: Int64
 end
 
-const AgentParams = Tuple{Vector{Polar}, Sizes}
+const CarParams = Tuple{Vector{Polar}, Sizes}
 
 struct Body
     x::Float64
@@ -46,7 +46,7 @@ struct Body
     theta::Float64
 end
 
-mutable struct Agent
+mutable struct Car
     feedback_nodes::Vector{Float64} # n_feedback_nodes
     network::Network
     body::Body
@@ -71,9 +71,9 @@ function randomnetwork(s)
 end
 
 
-function Agent(learning_rate :: Float64, params :: AgentParams, arena :: Arena)
+function Car(learning_rate :: Float64, params :: CarParams, arena :: Arena)
     (_, sizes) = params
-    return Agent(
+    return Car(
         randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes),
         randomnetwork(sizes),
         randomBody(arena),
@@ -263,7 +263,7 @@ function train(net::Network, inputs::Vector{Float64})::Tuple{Tuple{Float64, Vect
 end
 
 
-function updateagent(agent::Agent, params :: AgentParams, arena :: Arena)
+function updateagent(agent::Car, params :: CarParams, arena :: Arena)
     # possible future (micro-)optimisation: this currently updates the network
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
@@ -283,7 +283,6 @@ function updateagent(agent::Agent, params :: AgentParams, arena :: Arena)
         output = 0
     end
     feedback = outputs[2:end]
-    # TODO: store in AgentParams
     mem_decay_times = exp.(range(
         log(10.0),
         stop=log(100.0),
@@ -308,8 +307,16 @@ function update(bodies, arena :: Arena)
     end
 end
 
-function replicateagent(source :: Agent, target :: Agent, arena :: Arena, sizes :: Sizes)
+function replicatenetwork(source :: Network, target :: Network)
+    target.logvar_w[:,:] .= source.logvar_w
+    target.logvar_b[:] .= source.logvar_b
+    target.mean_w[:,:] .= source.mean_w
+    target.mean_b[:] .= source.mean_b
+    target.layer1_w[:,:] .= source.layer1_w
+    target.layer1_b[:] .= source.layer1_b
+end
 
+function replicatecar(source :: Car, target :: Car, arena :: Arena, sizes :: Sizes)
     target.optimiser.eta = source.optimiser.eta
     target.optimiser.beta = source.optimiser.beta
     target.optimiser.state = IdDict()
@@ -323,12 +330,7 @@ function replicateagent(source :: Agent, target :: Agent, arena :: Arena, sizes 
         feedback = source.feedback_nodes
         target.body = source.body
     end
-    target.network.logvar_w[:,:] .= network.logvar_w
-    target.network.logvar_b[:] .= network.logvar_b
-    target.network.mean_w[:,:] .= network.mean_w
-    target.network.mean_b[:] .= network.mean_b
-    target.network.layer1_w[:,:] .= network.layer1_w
-    target.network.layer1_b[:] .= network.layer1_b
+    replicatenetwork(network, target.network)
 
     target.feedback_nodes[:] .= feedback
 end
@@ -347,13 +349,13 @@ function sensorPoints(b::Body, sensorParams :: Vector{Polar}) :: Vector{Point}
     return [pointFromParams(length,angle) for (length,angle) in sensorParams]
 end
 
-function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float64}
+function sensorValues(b::Body, params :: CarParams, arena :: Arena) :: Vector{Float64}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
     return [!ontrack(p, arena) for p in points]
 end
 
-function agentparams() :: AgentParams
+function agentparams() :: CarParams
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -373,8 +375,9 @@ function cars()
     arena = createArena()
     params = agentparams()
     pop_size = 500
-    agents = [Agent(1e-4, params, arena) for _ in 1:pop_size]
+    agents = [Car(1e-4, params, arena) for _ in 1:pop_size]
     prev = time_ns()
+    last_print = 0
     tpf = 0.001
     while true
         for (k, agent) in enumerate(agents)
@@ -388,25 +391,23 @@ function cars()
                     neighbour_index = mod1(k+rand([-1,1]),length(agents))
                     neighbour = agents[neighbour_index]
                 end
-                # agent.body = randomBody(arena)
                 (_, sizes) = params
-                replicateagent(neighbour, agent, arena, sizes)
-                # agent.body = neighbour.body
-                # agent.optimiser = deepcopy(neighbour.optimiser)
-                # agent.feedback_nodes = copy(neighbour.feedback_nodes)
-                # agent.network = deepcopy(neighbour.network)
+                replicatecar(neighbour, agent, arena, sizes)
             end
         end
-        (plt, (_, height)) = draw_scene(arena, [agent.body for agent in agents])
-        println(UnicodePlots.show(plt))
         current = time_ns()
+        if current - last_print > 0.05e9
+            (plt, (_, height)) = draw_scene(arena, [agent.body for agent in agents])
+            println(UnicodePlots.show(plt))
+            @printf "%8.1ffps                   \n" (1/(tpf/1.0e9))
+            print("\033[s") # save cursor
+            print(string("\033[",height+3,"A")) # move up height+3 lines
+            last_print = current
+        end
         diff = current - prev
         seconds = diff/1.0e9
         alpha = 1 - exp(-0.001*seconds)
         tpf = tpf * alpha + (1 - alpha) * diff
-        @printf "%8.1ffps                   \n" (1/(tpf/1.0e9))
-        print("\033[s") # save cursor
-        print(string("\033[",height+3,"A")) # move up height+3 lines
         prev = current
     end
 end
