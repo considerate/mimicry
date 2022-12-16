@@ -43,7 +43,7 @@ struct Body
     y::Float64
     theta::Float64
 end
-
+*
 # A Car decides:
 # - what angle to turn using a gaussian
 mutable struct Car
@@ -389,7 +389,7 @@ function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{
     return [!ontrack(p, arena) for p in points]
 end
 
-function agentparams() :: AgentParams
+function agentparams(n_outputs) :: AgentParams
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -400,7 +400,7 @@ function agentparams() :: AgentParams
     n_sensors = length(sensorParams)
     n1 = n_sensors + n_feedback_nodes;
     n2 = n_hidden_nodes;
-    n3 = 1 + n_feedback_nodes;
+    n3 = n_outputs + n_feedback_nodes;
     sizes = Sizes(n1, n2, n3, n_sensors, n_feedback_nodes)
     return (sensorParams, sizes)
 end
@@ -481,9 +481,72 @@ function replicatepredatorprey(source, target, params :: AgentParams, bounds :: 
     target.attacking = 0
 end
 
+function sigmoid(x)
+    return 1 / (1 + exp(-x))
+end
+
+function animalsensors(b::Body, params :: AgentParams, predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}) :: Vector{Float64}
+    (sensorParams, _) = params
+    points = sensorPoints(b, sensorParams)
+    function dist(agent,p)
+        dx = agent.body.x - p[1]
+        dy = agent.body.y - p[2]
+        return sqrt(dx^2 + dy^2)
+    end
+    radius = 0.05
+    function classify(p)
+        if minimum(map(x -> dist(x,p), predators)) < radius
+            return 1
+        end
+        if minimum(map(x -> dist(x,p), prey)) < radius
+            return 2
+        end
+        if minimum(map(x -> dist(x,p), food)) < radius
+            return 3
+        end
+        return 0
+    end
+    return [classify(p) for p in points]
+end
+
+function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators, prey, food)
+    sensors = animalsensors(agent.body, params, predators, prey, food)
+    inputs = [sensors; agent.feedback_nodes*1.0]
+    (loss, _, _, outputs), grads = train(agent.network, inputs)
+    for name in fieldnames(Network)
+        param = getfield(agent.network, name)
+        grad = grads[name] # grads[getfield(agent.network,name)]
+        Flux.update!(agent.optimiser, param, grad)
+    end
+
+    vfwd = tanh(outputs[1])
+    vside = tanh(outputs[2])
+    speed = 0.1
+    attack = sigmoid(outputs[3])
+    # TODO: implement attack
+    feedback = outputs[4:end]
+    (_, sizes) = params
+    mem_decay_times = exp.(range(
+        log(10.0),
+        stop=log(100.0),
+        length=sizes.n_feedback_nodes
+    ))
+    agent.feedback_nodes = (
+        agent.feedback_nodes.*(1.0 .- 1.0./mem_decay_times)
+        + feedback.*(1.0./mem_decay_times)
+    )
+    body = agent.body
+    x = body.x + cos(body.theta) * vfwd * speed
+    y = body.y + sin(body.theta) * vside * speed
+    theta = atan(vside, vfwd)
+    agent.body = Body(x, y, theta)
+    agent.hunger -= 1
+    return (outputs, loss)
+end
+
 function animals()
     bounds :: Bounds = ((0, 10), (0, 10))
-    params = agentparams()
+    params = agentparams(3)
     (n_predators, n_prey, n_food) = (20, 100, 100)
     predators = [Predator(1e-4, params, bounds) for _ in 1:n_predators]
     prey = [Prey(1e-4, params, bounds) for _ in 1:n_prey]
@@ -491,7 +554,7 @@ function animals()
     last_print = 0
     while true
         for (k, predator) in enumerate(predators)
-            predator.hunger -= 1
+            updateanimal(predator, params, bounds, predators, prey, food)
             if predator.hunger <= 0 || predator.health <= 0
                 neighbour_index = mod1(k+rand([-1,1]),n_predators)
                 neighbour = predators[neighbour_index]
@@ -504,7 +567,7 @@ function animals()
             end
         end
         for (k, p) in enumerate(prey)
-            p.hunger -= 1
+            updateanimal(p, params, bounds, predators, prey, food)
             if p.hunger <= 0 || p.health <= 0
                 neighbour_index = mod1(k+rand([-1,1]), n_prey)
                 neighbour = prey[neighbour_index]
@@ -529,7 +592,7 @@ end
 
 function cars()
     arena = createArena()
-    params = agentparams()
+    params = agentparams(1)
     pop_size = 500
     agents = [Car(1e-4, params, arena) for _ in 1:pop_size]
     prev = time_ns()
