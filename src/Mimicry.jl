@@ -19,9 +19,7 @@ function cleanup()
     print("\033[?25h") # show cursor
 end
 
-# NB: The Network doesn't have to be mutable because all the contained Arrays are.
-# TODO: check if we can get this working with MVector and MMatrix from StaticArrays
-mutable struct Network
+struct Network
     layer1_w::Matrix{Float64}        # n1 -> n2  (n2 x n1)
     layer1_b::Vector{Float64}        # n2
     mean_w::Matrix{Float64}          # n2 -> n3  (n3 x n2)
@@ -38,7 +36,7 @@ struct Sizes
     n_feedback_nodes :: Int64
 end
 
-const CarParams = Tuple{Vector{Polar}, Sizes}
+const AgentParams = Tuple{Vector{Polar}, Sizes}
 
 struct Body
     x::Float64
@@ -46,11 +44,47 @@ struct Body
     theta::Float64
 end
 
+# A Car decides:
+# - what angle to turn using a gaussian
 mutable struct Car
     feedback_nodes::Vector{Float64} # n_feedback_nodes
     network::Network
     body::Body
     optimiser :: Flux.Adam
+end
+
+# A Predator decides:
+# - x movement speed using a gaussian (tanh)
+# - y movement speed using a gaussian (tanh)
+# - whether to attack or not (sigmoid)
+mutable struct Predator
+    feedback_nodes::Vector{Float64}
+    network::Network
+    hunger::Int64 # negative hunger implies death
+    attacking::Int64
+    health :: Int64
+    body::Body
+    optimiser :: Flux.Adam
+end
+
+# A Predator decides:
+# - x movement speed using a gaussian (tanh)
+# - y movement speed using a gaussian (tanh)
+# - whether to attack/eat food or not (sigmoid)
+mutable struct Prey
+    feedback_nodes::Vector{Float64}
+    network::Network
+    hunger::Int64
+    attacking::Int64
+    health :: Int64
+    body::Body
+    optimiser :: Flux.Adam
+end
+
+mutable struct Food
+    hunger :: Int64
+    health :: Int64
+    body :: Body
 end
 
 function randomnetwork(s)
@@ -71,7 +105,7 @@ function randomnetwork(s)
 end
 
 
-function Car(learning_rate :: Float64, params :: CarParams, arena :: Arena)
+function Car(learning_rate :: Float64, params :: AgentParams, arena :: Arena)
     (_, sizes) = params
     return Car(
         randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes),
@@ -263,7 +297,7 @@ function train(net::Network, inputs::Vector{Float64})::Tuple{Tuple{Float64, Vect
 end
 
 
-function updateagent(agent::Car, params :: CarParams, arena :: Arena)
+function updatecar(agent::Car, params :: AgentParams, arena :: Arena)
     # possible future (micro-)optimisation: this currently updates the network
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
@@ -349,13 +383,13 @@ function sensorPoints(b::Body, sensorParams :: Vector{Polar}) :: Vector{Point}
     return [pointFromParams(length,angle) for (length,angle) in sensorParams]
 end
 
-function sensorValues(b::Body, params :: CarParams, arena :: Arena) :: Vector{Float64}
+function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float64}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
     return [!ontrack(p, arena) for p in points]
 end
 
-function agentparams() :: CarParams
+function agentparams() :: AgentParams
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -371,6 +405,128 @@ function agentparams() :: CarParams
     return (sensorParams, sizes)
 end
 
+function PredatorPrey(learning_rate, params, bounds, f)
+    (_, sizes) = params
+    (x,y) = randompoint(bounds)
+    theta = rand()*tau
+    network = randomnetwork(sizes)
+    feedback =  randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
+    body = Body(x,y,theta)
+    optimiser = Flux.Optimise.Adam(learning_rate)
+    hunger = rand(80:100)
+    health = 100
+    attacking = 0
+    return f(
+        feedback,
+        network,
+        hunger,
+        attacking,
+        health,
+        body,
+        optimiser
+    )
+end
+
+function Predator(learning_rate, params, bounds) :: Predator
+    return PredatorPrey(learning_rate, params, bounds, Predator)
+end
+
+function Prey(learning_rate, params, bounds) :: Prey
+    return PredatorPrey(learning_rate, params, bounds, Prey)
+end
+
+function Food(bounds) :: Food
+    hunger = rand(20:60)
+    health = 100
+    (x,y) = randompoint(bounds)
+    theta = rand()*tau
+    body = Body(x,y,theta)
+    return Food(hunger, health, body)
+end
+
+function draw_animals(predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}, bounds :: Bounds)
+    ((xmin, xmax), (ymin, ymax)) = bounds
+    width=121
+    height=44
+    canvas = UnicodePlots.BrailleCanvas(height, width, origin_y=ymin, origin_x=xmin, height=ymax - ymin, width=xmax - xmin)
+    plt = UnicodePlots.Plot(canvas)
+    UnicodePlots.scatterplot!(plt, [p.body.x for p in predators], [p.body.y for p in predators], width=width, height=height, color=:red)
+    UnicodePlots.scatterplot!(plt, [p.body.x for p in prey], [p.body.y for p in prey], width=width, height=height, color=:green)
+    UnicodePlots.scatterplot!(plt, [p.body.x for p in food], [p.body.y for p in food], width=width, height=height, color=:blue)
+    return (plt, (width, height))
+end
+
+function replicatepredatorprey(source, target, params :: AgentParams, bounds :: Bounds)
+    (_, sizes) = params
+    target.optimiser.eta = source.optimiser.eta
+    target.optimiser.beta = source.optimiser.beta
+    target.optimiser.state = IdDict()
+
+    if rand() < 0.01
+        network = randomnetwork(sizes)
+        feedback = zeros(size(target.feedback_nodes))
+        (x,y) = randompoint(bounds)
+        theta = rand()*tau
+        target.body = Body(x,y,theta)
+    else
+        network = source.network
+        feedback = source.feedback_nodes
+        target.body = source.body
+    end
+    replicatenetwork(network, target.network)
+
+    target.feedback_nodes[:] .= feedback
+    target.hunger = rand(80:100)
+    target.health = 100
+    target.attacking = 0
+end
+
+function animals()
+    bounds :: Bounds = ((0, 10), (0, 10))
+    params = agentparams()
+    (n_predators, n_prey, n_food) = (20, 100, 100)
+    predators = [Predator(1e-4, params, bounds) for _ in 1:n_predators]
+    prey = [Prey(1e-4, params, bounds) for _ in 1:n_prey]
+    food = [Food(bounds) for _ in 1:n_food]
+    last_print = 0
+    while true
+        for (k, predator) in enumerate(predators)
+            predator.hunger -= 1
+            if predator.hunger <= 0 || predator.health <= 0
+                neighbour_index = mod1(k+rand([-1,1]),n_predators)
+                neighbour = predators[neighbour_index]
+                while neighbour.hunger <= 0 || neighbour.health <= 0
+                    k = neighbour
+                    neighbour_index = mod1(k+rand([-1,1]),n_predators)
+                    neighbour = predators[neighbour_index]
+                end
+                replicatepredatorprey(neighbour, predator, params, bounds)
+            end
+        end
+        for (k, p) in enumerate(prey)
+            p.hunger -= 1
+            if p.hunger <= 0 || p.health <= 0
+                neighbour_index = mod1(k+rand([-1,1]), n_prey)
+                neighbour = prey[neighbour_index]
+                while neighbour.hunger <= 0 || neighbour.health <= 0
+                    k = neighbour
+                    neighbour_index = mod1(k+rand([-1,1]), n_predators)
+                    neighbour = prey[neighbour_index]
+                end
+                replicatepredatorprey(neighbour, p, params, bounds)
+            end
+        end
+        current = time_ns()
+        if current - last_print > 0.05e9
+            (plt, (_, height)) = draw_animals(predators, prey, food, bounds)
+            println(UnicodePlots.show(plt))
+            print("\033[s") # save cursor
+            print(string("\033[",height+2,"A")) # move up height+2 lines
+            last_print = current
+        end
+    end
+end
+
 function cars()
     arena = createArena()
     params = agentparams()
@@ -381,7 +537,7 @@ function cars()
     tpf = 0.001
     while true
         for (k, agent) in enumerate(agents)
-            updateagent(agent, params, arena)
+            updatecar(agent, params, arena)
             alive = ontrack((agent.body.x, agent.body.y), arena)
             if !alive
                 neighbour_index = mod1(k+rand([-1,1]),length(agents))
@@ -418,7 +574,7 @@ function main()
     print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
     try
-        cars()
+        animals()
     catch e
         if isa(e, Core.InterruptException)
             println("\033[uexiting")
