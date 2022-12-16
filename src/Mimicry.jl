@@ -308,21 +308,29 @@ function update(bodies, arena :: Arena)
     end
 end
 
-function replicateagent(source :: Agent, target :: Agent)
-    target.body = source.body
+function replicateagent(source :: Agent, target :: Agent, arena :: Arena, sizes :: Sizes)
 
     target.optimiser.eta = source.optimiser.eta
     target.optimiser.beta = source.optimiser.beta
     target.optimiser.state = IdDict()
 
-    target.network.logvar_w[:,:] .= source.network.logvar_w
-    target.network.logvar_b[:] .= source.network.logvar_b
-    target.network.mean_w[:,:] .= source.network.mean_w
-    target.network.mean_b[:] .= source.network.mean_b
-    target.network.layer1_w[:,:] .= source.network.layer1_w
-    target.network.layer1_b[:] .= source.network.layer1_b
+    if rand() < 0.01
+        network = randomnetwork(sizes)
+        feedback = zeros(size(target.feedback_nodes))
+        target.body = randomBody(arena)
+    else
+        network = source.network
+        feedback = source.feedback_nodes
+        target.body = source.body
+    end
+    target.network.logvar_w[:,:] .= network.logvar_w
+    target.network.logvar_b[:] .= network.logvar_b
+    target.network.mean_w[:,:] .= network.mean_w
+    target.network.mean_b[:] .= network.mean_b
+    target.network.layer1_w[:,:] .= network.layer1_w
+    target.network.layer1_b[:] .= network.layer1_b
 
-    target.feedback_nodes[:] .= source.feedback_nodes
+    target.feedback_nodes[:] .= feedback
 end
 
 function loop(agents :: Vector{Agent}, arena :: Arena, params :: AgentParams)
@@ -341,7 +349,8 @@ function loop(agents :: Vector{Agent}, arena :: Arena, params :: AgentParams)
                     neighbour = agents[neighbour_index]
                 end
                 # agent.body = randomBody(arena)
-                replicateagent(neighbour, agent)
+                (_, sizes) = params
+                replicateagent(neighbour, agent, arena, sizes)
                 # agent.body = neighbour.body
                 # agent.optimiser = deepcopy(neighbour.optimiser)
                 # agent.feedback_nodes = copy(neighbour.feedback_nodes)
