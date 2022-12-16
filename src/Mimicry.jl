@@ -333,7 +333,47 @@ function replicateagent(source :: Agent, target :: Agent, arena :: Arena, sizes 
     target.feedback_nodes[:] .= feedback
 end
 
-function loop(agents :: Vector{Agent}, arena :: Arena, params :: AgentParams)
+
+function sensorPoints(b::Body, sensorParams :: Vector{Polar}) :: Vector{Point}
+    # for a possible future performance optimisation - only check the endpoints
+    # are within the arena, not the whole line.
+    function pointFromParams(length,angle)
+        x0 = b.x
+        y0 = b.y
+        x1 = x0 + length*sin(angle + b.theta)
+        y1 = y0 + length*cos(angle + b.theta)
+        return (x1,y1)
+    end
+    return [pointFromParams(length,angle) for (length,angle) in sensorParams]
+end
+
+function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float64}
+    (sensorParams, _) = params
+    points = sensorPoints(b, sensorParams)
+    return [!ontrack(p, arena) for p in points]
+end
+
+function agentparams() :: AgentParams
+    sensorParams :: Vector{Polar} = [
+        (d, a*tau)
+        for d in [0.1, 0.2, 0.3, 0.4, 0.5]
+        for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25]
+    ]
+    n_feedback_nodes = 10
+    n_hidden_nodes = 20
+    n_sensors = length(sensorParams)
+    n1 = n_sensors + n_feedback_nodes;
+    n2 = n_hidden_nodes;
+    n3 = 1 + n_feedback_nodes;
+    sizes = Sizes(n1, n2, n3, n_sensors, n_feedback_nodes)
+    return (sensorParams, sizes)
+end
+
+function cars()
+    arena = createArena()
+    params = agentparams()
+    pop_size = 500
+    agents = [Agent(1e-4, params, arena) for _ in 1:pop_size]
     prev = time_ns()
     tpf = 0.001
     while true
@@ -371,60 +411,22 @@ function loop(agents :: Vector{Agent}, arena :: Arena, params :: AgentParams)
     end
 end
 
-function sensorPoints(b::Body, sensorParams :: Vector{Polar}) :: Vector{Point}
-    # for a possible future performance optimisation - only check the endpoints
-    # are within the arena, not the whole line.
-    function pointFromParams(length,angle)
-        x0 = b.x
-        y0 = b.y
-        x1 = x0 + length*sin(angle + b.theta)
-        y1 = y0 + length*cos(angle + b.theta)
-        return (x1,y1)
-    end
-    return [pointFromParams(length,angle) for (length,angle) in sensorParams]
-end
-
-function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float64}
-    (sensorParams, _) = params
-    points = sensorPoints(b, sensorParams)
-    return [!ontrack(p, arena) for p in points]
-end
-
-function agentparams() :: AgentParams
-    sensorParams :: Vector{Polar} = [
-        (d, a*tau)
-        for d in [0.1, 0.2, 0.3, 0.4, 0.5]
-        for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25]
-    ]
-    n_feedback_nodes = 10
-    n_hidden_nodes = 20
-    n_sensors = length(sensorParams)
-    n1 = n_sensors + n_feedback_nodes;
-    n2 = n_hidden_nodes;
-    n3 = 1 + n_feedback_nodes;
-    sizes = Sizes(n1, n2, n3, n_sensors, n_feedback_nodes)
-    return (sensorParams, sizes)
-end
-
 function main()
     atexit(cleanup)
-    arena = createArena()
     (_, backup_termios) = disable_echo()
-    params = agentparams()
-    pop_size = 500
-    agents = [Agent(1e-4, params, arena) for _ in 1:pop_size]
     print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
     try
-        loop(agents, arena, params)
+        cars()
     catch e
         if isa(e, Core.InterruptException)
-            TERMIOS.tcsetattr(stdin, TERMIOS.TCSANOW, backup_termios)
-            cleanup()
             println("\033[uexiting")
         else
             throw(e)
         end
+    finally
+        TERMIOS.tcsetattr(stdin, TERMIOS.TCSANOW, backup_termios)
+        cleanup()
     end
 end
 
