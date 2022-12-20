@@ -43,7 +43,7 @@ struct Body
     y::Float64
     theta::Float64
 end
-*
+
 # A Car decides:
 # - what angle to turn using a gaussian
 mutable struct Car
@@ -58,6 +58,7 @@ end
 # - y movement speed using a gaussian (tanh)
 # - whether to attack or not (sigmoid)
 mutable struct Predator
+    animal :: Int64 # TODO: replace with a proper type
     feedback_nodes::Vector{Float64}
     network::Network
     hunger::Int64 # negative hunger implies death
@@ -72,6 +73,7 @@ end
 # - y movement speed using a gaussian (tanh)
 # - whether to attack/eat food or not (sigmoid)
 mutable struct Prey
+    animal :: Int64
     feedback_nodes::Vector{Float64}
     network::Network
     hunger::Int64
@@ -405,7 +407,7 @@ function agentparams(n_outputs) :: AgentParams
     return (sensorParams, sizes)
 end
 
-function PredatorPrey(learning_rate, params, bounds, f)
+function PredatorPrey(learning_rate, params, bounds, animal, f)
     (_, sizes) = params
     (x,y) = randompoint(bounds)
     theta = rand()*tau
@@ -417,6 +419,7 @@ function PredatorPrey(learning_rate, params, bounds, f)
     health = 100
     attacking = 0
     return f(
+        animal,
         feedback,
         network,
         hunger,
@@ -428,16 +431,16 @@ function PredatorPrey(learning_rate, params, bounds, f)
 end
 
 function Predator(learning_rate, params, bounds) :: Predator
-    return PredatorPrey(learning_rate, params, bounds, Predator)
+    return PredatorPrey(learning_rate, params, bounds, 1, Predator)
 end
 
 function Prey(learning_rate, params, bounds) :: Prey
-    return PredatorPrey(learning_rate, params, bounds, Prey)
+    return PredatorPrey(learning_rate, params, bounds, 2, Prey)
 end
 
 function Food(bounds) :: Food
-    hunger = rand(20:60)
-    health = 100
+    hunger = rand(60:120)
+    health = 40
     (x,y) = randompoint(bounds)
     theta = rand()*tau
     body = Body(x,y,theta)
@@ -485,6 +488,20 @@ function sigmoid(x)
     return 1 / (1 + exp(-x))
 end
 
+function sqdist(a,b)
+    return (a.x - b.x)^2 + (a.y - b.y)^2
+end
+
+function inview(a, b, c, field)
+    ac_x = c.x - a.x
+    ac_y = c.y - a.y
+    ab_x = b.x - a.x
+    ab_y = b.y - a.y
+    ac_l = sqrt(sqdist(a,c))
+    ab_l = sqrt(sqdist(a,b))
+    return (ac_x*ab_x + ac_y*ab_y)/(ac_l*ab_l) >= field
+end
+
 function animalsensors(b::Body, params :: AgentParams, predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}) :: Vector{Float64}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
@@ -507,6 +524,13 @@ function animalsensors(b::Body, params :: AgentParams, predators :: Vector{Preda
         return 0
     end
     return [classify(p) for p in points]
+end
+
+function clampbounds(body, bounds)
+    ((xmin, xmax), (ymin, ymax)) = bounds
+    x = max(xmin, min(xmax, body.x))
+    y = max(ymin, min(ymax, body.y))
+    return Body(x,y,body.theta)
 end
 
 function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators, prey, food)
@@ -536,18 +560,51 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
         + feedback.*(1.0./mem_decay_times)
     )
     body = agent.body
+    attackradius = 0.5
+    attackfield = cos(0.1*tau)
+    radiussq = attackradius * attackradius
     x = body.x + cos(body.theta) * vfwd * speed
     y = body.y + sin(body.theta) * vside * speed
     theta = atan(vside, vfwd)
-    agent.body = Body(x, y, theta)
-    agent.hunger -= 1
+    agent.body = clampbounds(Body(x, y, theta), bounds)
+    fwd = Body(body.x + cos(body.theta) * attackradius,
+               body.y + sin(body.theta) * attackradius,
+               theta,
+              )
+    agent.hunger -= 10
+    if attack >= 0.5
+        if agent.animal == 1
+            for p in prey
+                if sqdist(p.body, body) < radiussq && inview(p.body, body, fwd, attackfield)
+                    p.health -= 40
+                    if p.health <= 0
+                        agent.hunger += 200
+                    end
+                end
+            end
+            for f in food
+                if sqdist(f.body, body) < radiussq && inview(f.body, body, fwd, attackfield)
+                    f.health -= 20
+                end
+            end
+        elseif agent.animal == 2
+            for f in food
+                if sqdist(f.body, body) < radiussq && inview(f.body, body, fwd, attackfield)
+                    f.health -= 40
+                    if f.health <= 0
+                        agent.hunger += f.hunger
+                    end
+                end
+            end
+        end
+    end
     return (outputs, loss)
 end
 
 function animals()
     bounds :: Bounds = ((0, 10), (0, 10))
     params = agentparams(3)
-    (n_predators, n_prey, n_food) = (20, 100, 100)
+    (n_predators, n_prey, n_food) = (50, 100, 50)
     predators = [Predator(1e-4, params, bounds) for _ in 1:n_predators]
     prey = [Prey(1e-4, params, bounds) for _ in 1:n_prey]
     food = [Food(bounds) for _ in 1:n_food]
@@ -559,7 +616,7 @@ function animals()
                 neighbour_index = mod1(k+rand([-1,1]),n_predators)
                 neighbour = predators[neighbour_index]
                 while neighbour.hunger <= 0 || neighbour.health <= 0
-                    k = neighbour
+                    k = neighbour_index
                     neighbour_index = mod1(k+rand([-1,1]),n_predators)
                     neighbour = predators[neighbour_index]
                 end
@@ -572,11 +629,16 @@ function animals()
                 neighbour_index = mod1(k+rand([-1,1]), n_prey)
                 neighbour = prey[neighbour_index]
                 while neighbour.hunger <= 0 || neighbour.health <= 0
-                    k = neighbour
-                    neighbour_index = mod1(k+rand([-1,1]), n_predators)
+                    k = neighbour_index
+                    neighbour_index = mod1(k+rand([-1,1]), n_prey)
                     neighbour = prey[neighbour_index]
                 end
                 replicatepredatorprey(neighbour, p, params, bounds)
+            end
+        end
+        for (k, f) in enumerate(food)
+            if f.health <= 0
+                food[k] = Food(bounds)
             end
         end
         current = time_ns()
@@ -636,8 +698,15 @@ function main()
     (_, backup_termios) = disable_echo()
     print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
+    game = ARGS[1]
     try
-        animals()
+        if game == "cars"
+            cars()
+        elseif game == "animals"
+            animals()
+        else
+            animals()
+        end
     catch e
         if isa(e, Core.InterruptException)
             println("\033[uexiting")
