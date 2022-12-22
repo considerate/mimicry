@@ -547,7 +547,6 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
     vside = tanh(outputs[2])
     speed = 0.1
     attack = sigmoid(outputs[3])
-    # TODO: implement attack
     feedback = outputs[4:end]
     (_, sizes) = params
     mem_decay_times = exp.(range(
@@ -571,11 +570,12 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
                body.y + sin(body.theta) * attackradius,
                theta,
               )
-    agent.hunger -= 10
+    agent.hunger -= 5
     if attack >= 0.5
+        agent.hunger -= 20
         if agent.animal == 1
             for p in prey
-                if sqdist(p.body, body) < radiussq && inview(p.body, body, fwd, attackfield)
+                if sqdist(p.body, body) < radiussq && inview(body, p.body, fwd, attackfield)
                     p.health -= 40
                     if p.health <= 0
                         agent.hunger += 200
@@ -583,17 +583,22 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
                 end
             end
             for f in food
-                if sqdist(f.body, body) < radiussq && inview(f.body, body, fwd, attackfield)
+                if sqdist(f.body, body) < radiussq && inview(body, f.body, fwd, attackfield)
                     f.health -= 20
                 end
             end
         elseif agent.animal == 2
             for f in food
-                if sqdist(f.body, body) < radiussq && inview(f.body, body, fwd, attackfield)
+                if sqdist(f.body, body) < radiussq && inview(body, f.body, fwd, attackfield)
                     f.health -= 40
                     if f.health <= 0
                         agent.hunger += f.hunger
                     end
+                end
+            end
+            for p in predators
+                if sqdist(p.body, body) < radiussq && inview(body, p.body, fwd, attackfield)
+                    p.health -= 10
                 end
             end
         end
