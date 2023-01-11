@@ -2,11 +2,14 @@ module Mimicry
 
 import UnicodePlots
 import Zygote
-import Flux
 import PolygonOps
 import StaticArrays
 import TERMIOS
+import Lux
+import Optimisers
 using Printf
+import NamedTupleTools
+import Random
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float64}}
@@ -19,14 +22,29 @@ function cleanup()
     print("\033[?25h") # show cursor
 end
 
-struct Network
-    layer1_w::Matrix{Float64}        # n1 -> n2  (n2 x n1)
-    layer1_b::Vector{Float64}        # n2
-    mean_w::Matrix{Float64}          # n2 -> n3  (n3 x n2)
-    mean_b::Vector{Float64}          # n3
-    logvar_w::Matrix{Float64}        # n2 -> n3  (n3 x n2)
-    logvar_b::Vector{Float64}        # n3
+struct Network <: Lux.AbstractExplicitLayer
+    dense :: Lux.Dense
+    means :: Lux.Dense
+    logvars :: Lux.Dense
 end
+
+function Lux.initialparameters(rng::Random.AbstractRNG, network :: Network)
+    layers = NamedTupleTools.ntfromstruct(network)
+    return Lux.initialparameters(rng, layers)
+end
+
+function Lux.initialstates(rng::Random.AbstractRNG, network :: Network)
+    layers = NamedTupleTools.ntfromstruct(network)
+    return Lux.initialstates(rng, layers)
+end
+
+@inline function (network::Network)(x :: AbstractArray, ps :: NamedTuple, st::NamedTuple)
+    y, st_dense = network.dense(x, ps.dense, st.dense)
+    mu, st_mean = network.means(y, ps.means, st.means)
+    sigma, st_logvar = network.logvars(y, ps.logvars, st.logvars)
+    return (means=mu, logvars=sigma), (dense=st_dense, mean=st_mean, logvar=st_logvar)
+end
+
 
 struct Sizes
     n1 :: Int64
@@ -49,8 +67,10 @@ end
 mutable struct Car
     feedback_nodes::Vector{Float64} # n_feedback_nodes
     network::Network
+    parameters::NamedTuple
+    state::NamedTuple
     body::Body
-    optimiser :: Flux.Adam
+    optimiser_state :: NamedTuple
 end
 
 # A Predator decides:
@@ -61,11 +81,13 @@ mutable struct Predator
     animal :: Int64 # TODO: replace with a proper type
     feedback_nodes::Vector{Float64}
     network::Network
+    parameters::NamedTuple
+    state::NamedTuple
     hunger::Int64 # negative hunger implies death
     attacking::Int64
     health :: Int64
     body::Body
-    optimiser :: Flux.Adam
+    #optimiser :: Flux.Adam
 end
 
 # A Predator decides:
@@ -76,11 +98,13 @@ mutable struct Prey
     animal :: Int64
     feedback_nodes::Vector{Float64}
     network::Network
+    parameters::NamedTuple
+    state::NamedTuple
     hunger::Int64
     attacking::Int64
     health :: Int64
     body::Body
-    optimiser :: Flux.Adam
+    # optimiser :: Flux.Adam
 end
 
 mutable struct Food
@@ -89,31 +113,30 @@ mutable struct Food
     body :: Body
 end
 
-function randomnetwork(s)
-    layer1_w = randn((s.n2,s.n1)) * sqrt(2.0/s.n1)
-    layer1_b = zeros(s.n2)
-    mean_w = randn((s.n3,s.n2)) * sqrt(2.0/s.n2)
-    mean_b = zeros(s.n3)
-    logvar_w = randn((s.n3,s.n2)) * sqrt(2.0/s.n2)
-    logvar_b = zeros(s.n3)
-    return Network(
-        layer1_w,
-        layer1_b,
-        mean_w,
-        mean_b,
-        logvar_w,
-        logvar_b
-    )
+function randomnetwork(rng, s)
+    min_std_deviation = 0.01
+    min_logvar = 2*log(min_std_deviation)
+    network = Network(Lux.Dense(s.n1, s.n2, Lux.relu),
+                      Lux.Dense(s.n2, s.n3),
+                      Lux.Dense(s.n2, s.n3, x -> max.(x, min_logvar)),
+                     )
+    ps, st = Lux.setup(rng, network)
+    return network, ps, st
 end
 
 
-function Car(learning_rate :: Float64, params :: AgentParams, arena :: Arena)
+function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
     (_, sizes) = params
+    network, ps, st = randomnetwork(rng, sizes)
+    st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
+    feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     return Car(
-        randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes),
-        randomnetwork(sizes),
+        feedback_nodes,
+        network,
+        ps,
+        st,
         randomBody(arena),
-        Flux.Optimise.Adam(learning_rate)
+        st_opt,
     )
 end
 
@@ -121,19 +144,6 @@ function gaussloss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vect
     squared_deviations = (outputs-means).^2
     gaussian_loss = 0.5*sum(squared_deviations .* exp.(-logvars) + logvars)/length(outputs)
     return gaussian_loss #+ 0.01*l2(net)
-end
-
-function relu(x)
-    return max(x, 0)
-end
-
-function network(net :: Network, inputs :: Vector{Float64}) ::Tuple{Vector{Float64},Vector{Float64}}
-    min_std_deviation = 0.01
-    min_logvar = 2*log(min_std_deviation)
-    layer1_activations = relu.(net.layer1_w * inputs + net.layer1_b)
-    means = net.mean_w * layer1_activations + net.mean_b
-    logvars = max.(net.logvar_w * layer1_activations + net.logvar_b, min_logvar)
-    return (means, logvars)
 end
 
 function randompoint(bounds::Bounds) :: Point
@@ -288,14 +298,13 @@ function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64
     return randn(length(means)).*sigma + means
 end
 
-function train(net::Network, inputs::Vector{Float64})::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any}
-    (means, logvars), dforward = Zygote.pullback(network, net, inputs)
-    outputs = sample(means,logvars)
-    loss, dloss = Zygote.pullback(gaussloss, means, logvars, outputs)
-    (dmean, dlogvars, _) = dloss(1.0)
-    (grads, _) = dforward((dmean, dlogvars))
-    g2 = Zygote._project(net, grads)
-    return ((loss, means, logvars, outputs), g2)
+function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+    (probs, st1), dforward = Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
+    sampled = sample(probs.means, probs.logvars)
+    loss, dloss = Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
+    dprob = dloss(1.0)[1]
+    grads1 = dforward((dprob, nothing))[1]
+    return ((loss, probs.means, probs.logvars, sampled), grads1, st1)
 end
 
 
@@ -304,12 +313,8 @@ function updatecar(agent::Car, params :: AgentParams, arena :: Arena)
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    (loss, _, _, outputs), grads = train(agent.network, inputs)
-    for name in fieldnames(Network)
-        param = getfield(agent.network, name)
-        grad = grads[name] # grads[getfield(agent.network,name)]
-        Flux.update!(agent.optimiser, param, grad)
-    end
+    ((loss, _, _, outputs), grads, st1) = train(agent.network, inputs, agent.parameters, agent.state)
+    Optimisers.update(agent.optimiser_state, agent.parameters, grads)
 
     output = outputs[1]
     if isnan(output)
@@ -352,23 +357,21 @@ function replicatenetwork(source :: Network, target :: Network)
     target.layer1_b[:] .= source.layer1_b
 end
 
-function replicatecar(source :: Car, target :: Car, arena :: Arena, sizes :: Sizes)
-    target.optimiser.eta = source.optimiser.eta
-    target.optimiser.beta = source.optimiser.beta
-    target.optimiser.state = IdDict()
-
-    if rand() < 0.01
-        network = randomnetwork(sizes)
-        feedback = zeros(size(target.feedback_nodes))
+function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
+    if Random.rand(rng) < 0.01
+        ps, st = Lux.setup(rng, target.network)
+        target.parameters = ps
+        target.state = st
+        target.feedback_nodes[:] .=  zeros(size(target.feedback_nodes))
         target.body = randomBody(arena)
     else
-        network = source.network
-        feedback = source.feedback_nodes
+        target.network = source.network
+        target.feedback_nodes[:] .= source.feedback_nodes
+        target.parameters = deepcopy(source.parameters)
+        target.state = deepcopy(source.state)
         target.body = source.body
     end
-    replicatenetwork(network, target.network)
 
-    target.feedback_nodes[:] .= feedback
 end
 
 
@@ -502,7 +505,18 @@ function inview(a, b, c, field)
     return (ac_x*ab_x + ac_y*ab_y)/(ac_l*ab_l) >= field
 end
 
-function animalsensors(b::Body, params :: AgentParams, predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}) :: Vector{Float64}
+function outside(p, bounds)
+    ((xmin, xmax), (ymin, ymax)) = bounds
+    if p[1] < xmin || p[1] > xmax
+        return true
+    end
+    if p[2] < ymin || p[2] > ymax
+        return true
+    end
+    return false
+end
+
+function animalsensors(b::Body, params :: AgentParams, bounds :: Bounds, predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}) :: Vector{Float64}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
     function dist(agent,p)
@@ -512,6 +526,9 @@ function animalsensors(b::Body, params :: AgentParams, predators :: Vector{Preda
     end
     radius = 0.05
     function classify(p)
+        if outside(p, bounds)
+            return 4
+        end
         if minimum(map(x -> dist(x,p), predators)) < radius
             return 1
         end
@@ -534,7 +551,7 @@ function clampbounds(body, bounds)
 end
 
 function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators, prey, food)
-    sensors = animalsensors(agent.body, params, predators, prey, food)
+    sensors = animalsensors(agent.body, params, bounds, predators, prey, food)
     inputs = [sensors; agent.feedback_nodes*1.0]
     (loss, _, _, outputs), grads = train(agent.network, inputs)
     for name in fieldnames(Network)
@@ -570,9 +587,9 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
                body.y + sin(body.theta) * attackradius,
                theta,
               )
-    agent.hunger -= 5
+    agent.hunger -= 2
     if attack >= 0.5
-        agent.hunger -= 20
+        agent.hunger -= 2
         if agent.animal == 1
             for p in prey
                 if sqdist(p.body, body) < radiussq && inview(body, p.body, fwd, attackfield)
@@ -620,10 +637,16 @@ function animals()
             if predator.hunger <= 0 || predator.health <= 0
                 neighbour_index = mod1(k+rand([-1,1]),n_predators)
                 neighbour = predators[neighbour_index]
+                retries = 0
                 while neighbour.hunger <= 0 || neighbour.health <= 0
                     k = neighbour_index
                     neighbour_index = mod1(k+rand([-1,1]),n_predators)
                     neighbour = predators[neighbour_index]
+                    retries += 1
+                    if retries > 20
+                        neighbour = Predator(1e-4, params, bounds)
+                        break
+                    end
                 end
                 replicatepredatorprey(neighbour, predator, params, bounds)
             end
@@ -633,10 +656,16 @@ function animals()
             if p.hunger <= 0 || p.health <= 0
                 neighbour_index = mod1(k+rand([-1,1]), n_prey)
                 neighbour = prey[neighbour_index]
+                retries = 0
                 while neighbour.hunger <= 0 || neighbour.health <= 0
                     k = neighbour_index
                     neighbour_index = mod1(k+rand([-1,1]), n_prey)
                     neighbour = prey[neighbour_index]
+                    retries += 1
+                    if retries > 20
+                        neighbour = Prey(1e-4, params, bounds)
+                        break
+                    end
                 end
                 replicatepredatorprey(neighbour, p, params, bounds)
             end
@@ -661,7 +690,9 @@ function cars()
     arena = createArena()
     params = agentparams(1)
     pop_size = 500
-    agents = [Car(1e-4, params, arena) for _ in 1:pop_size]
+    rng = Random.default_rng()
+    Random.seed!(rng, 0)
+    agents = [Car(rng, 1e-4, params, arena) for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
     tpf = 0.001
@@ -678,7 +709,7 @@ function cars()
                     neighbour = agents[neighbour_index]
                 end
                 (_, sizes) = params
-                replicatecar(neighbour, agent, arena, sizes)
+                replicatecar(rng, neighbour, agent, arena)
             end
         end
         current = time_ns()
@@ -710,7 +741,7 @@ function main()
         elseif game == "animals"
             animals()
         else
-            animals()
+            cars()
         end
     catch e
         if isa(e, Core.InterruptException)
