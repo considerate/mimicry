@@ -631,42 +631,53 @@ function animals()
     food = [Food(bounds) for _ in 1:n_food]
     last_print = 0
     while true
-        for (k, predator) in enumerate(predators)
+        Threads.@threads for k in 1:length(predators)
+            predator = predators[k]
             updateanimal(predator, params, bounds, predators, prey, food)
-            if predator.hunger <= 0 || predator.health <= 0
-                neighbour_index = mod1(k+rand([-1,1]),n_predators)
-                neighbour = predators[neighbour_index]
+        end
+        alive = [p.hunger > 0 && p.health > 0 for p in predators]
+        Threads.@threads for k in 1:length(predators)
+            predator = predators[k]
+            if !alive[k]
+                neighbour = mod1(k+rand([-1,1]),n_predators)
                 retries = 0
-                while neighbour.hunger <= 0 || neighbour.health <= 0
-                    k = neighbour_index
-                    neighbour_index = mod1(k+rand([-1,1]),n_predators)
-                    neighbour = predators[neighbour_index]
+                target = predators[neighbour]
+                while !alive[neighbour]
+                    k = neighbour
+                    neighbour = mod1(k+rand([-1,1]),n_predators)
+                    target = predators[neighbour]
                     retries += 1
                     if retries > 20
-                        neighbour = Predator(rng, 1e-4, params, bounds)
+                        target = Predator(rng, 1e-4, params, bounds)
                         break
                     end
                 end
-                replicatepredatorprey(rng, neighbour, predator, bounds)
+                @assert alive[neighbour] || retries > 20
+                replicatepredatorprey(rng, target, predator, bounds)
             end
         end
-        for (k, p) in enumerate(prey)
+        Threads.@threads for k in 1:length(prey)
+            p = prey[k]
             updateanimal(p, params, bounds, predators, prey, food)
-            if p.hunger <= 0 || p.health <= 0
-                neighbour_index = mod1(k+Random.rand(rng, [-1,1]), n_prey)
-                neighbour = prey[neighbour_index]
+        end
+        alive = [p.hunger > 0 && p.health > 0 for p in prey]
+        Threads.@threads for k in 1:length(prey)
+            if !alive[k]
+                neighbour = mod1(k+Random.rand(rng, [-1,1]), n_prey)
+                target = prey[neighbour]
                 retries = 0
-                while neighbour.hunger <= 0 || neighbour.health <= 0
-                    k = neighbour_index
-                    neighbour_index = mod1(k+rand([-1,1]), n_prey)
-                    neighbour = prey[neighbour_index]
+                while !alive[neighbour]
+                    k = neighbour
+                    neighbour = mod1(k+rand([-1,1]), n_prey)
+                    target = prey[neighbour]
                     retries += 1
                     if retries > 20
-                        neighbour = Prey(rng, 1e-4, params, bounds)
+                        target = Prey(rng, 1e-4, params, bounds)
                         break
                     end
                 end
-                replicatepredatorprey(rng, neighbour, p, bounds)
+                @assert alive[neighbour] || retries > 20
+                replicatepredatorprey(rng, target, prey[k], bounds)
             end
         end
         for (k, f) in enumerate(food)
