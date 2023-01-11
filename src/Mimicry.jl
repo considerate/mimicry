@@ -83,7 +83,7 @@ mutable struct Predator
     network::Network
     parameters::NamedTuple
     state::NamedTuple
-    hunger::Int64 # negative hunger implies death
+    energy::Int64 # negative energy implies death
     attacking::Int64
     health :: Int64
     body::Body
@@ -100,7 +100,7 @@ mutable struct Prey
     network::Network
     parameters::NamedTuple
     state::NamedTuple
-    hunger::Int64
+    energy::Int64
     attacking::Int64
     health :: Int64
     body::Body
@@ -108,7 +108,7 @@ mutable struct Prey
 end
 
 mutable struct Food
-    hunger :: Int64
+    energy :: Int64
     health :: Int64
     body :: Body
 end
@@ -419,7 +419,7 @@ function PredatorPrey(rng, learning_rate, params, bounds, animal, f)
     (x,y) = randompoint(bounds)
     theta = rand()*tau
     body = Body(x,y,theta)
-    hunger = rand(80:100)
+    energy = rand(400:500)
     health = 100
     attacking = 0
     return f(
@@ -428,7 +428,7 @@ function PredatorPrey(rng, learning_rate, params, bounds, animal, f)
         network,
         ps,
         st,
-        hunger,
+        energy,
         attacking,
         health,
         body,
@@ -445,12 +445,12 @@ function Prey(rng, learning_rate, params, bounds) :: Prey
 end
 
 function Food(bounds) :: Food
-    hunger = rand(60:120)
+    energy = rand(60:120)
     health = 40
     (x,y) = randompoint(bounds)
     theta = rand()*tau
     body = Body(x,y,theta)
-    return Food(hunger, health, body)
+    return Food(energy, health, body)
 end
 
 function draw_animals(predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}, bounds :: Bounds)
@@ -483,7 +483,7 @@ function replicatepredatorprey(rng, source, target, bounds :: Bounds)
         target.body = source.body
     end
 
-    target.hunger = Random.rand(rng, 80:100)
+    target.energy = source.energy
     target.health = 100
     target.attacking = 0
 end
@@ -584,15 +584,15 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
                body.y + sin(body.theta) * attackradius,
                theta,
               )
-    agent.hunger -= 2
+    agent.energy -= 2
     if attack >= 0.5
-        agent.hunger -= 2
+        agent.energy -= 2
         if agent.animal == 1
             for p in prey
                 if sqdist(p.body, body) < radiussq && inview(body, p.body, fwd, attackfield)
                     p.health -= 40
                     if p.health <= 0
-                        agent.hunger += 200
+                        agent.energy += 200
                     end
                 end
             end
@@ -606,7 +606,7 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
                 if sqdist(f.body, body) < radiussq && inview(body, f.body, fwd, attackfield)
                     f.health -= 40
                     if f.health <= 0
-                        agent.hunger += f.hunger
+                        agent.energy += f.energy
                     end
                 end
             end
@@ -635,7 +635,7 @@ function animals()
             predator = predators[k]
             updateanimal(predator, params, bounds, predators, prey, food)
         end
-        alive = [p.hunger > 0 && p.health > 0 for p in predators]
+        alive = [p.energy > 0 && p.health > 0 for p in predators]
         Threads.@threads for k in 1:length(predators)
             predator = predators[k]
             if !alive[k]
@@ -660,7 +660,7 @@ function animals()
             p = prey[k]
             updateanimal(p, params, bounds, predators, prey, food)
         end
-        alive = [p.hunger > 0 && p.health > 0 for p in prey]
+        alive = [p.energy > 0 && p.health > 0 for p in prey]
         Threads.@threads for k in 1:length(prey)
             if !alive[k]
                 neighbour = mod1(k+Random.rand(rng, [-1,1]), n_prey)
