@@ -87,7 +87,7 @@ mutable struct Predator
     attacking::Int64
     health :: Int64
     body::Body
-    #optimiser :: Flux.Adam
+    optimiser_state :: NamedTuple
 end
 
 # A Predator decides:
@@ -104,7 +104,7 @@ mutable struct Prey
     attacking::Int64
     health :: Int64
     body::Body
-    # optimiser :: Flux.Adam
+    optimiser_state :: NamedTuple
 end
 
 mutable struct Food
@@ -313,7 +313,7 @@ function updatecar(agent::Car, params :: AgentParams, arena :: Arena)
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    ((loss, _, _, outputs), grads, st1) = train(agent.network, inputs, agent.parameters, agent.state)
+    ((loss, _, _, outputs), grads, _) = train(agent.network, inputs, agent.parameters, agent.state)
     Optimisers.update(agent.optimiser_state, agent.parameters, grads)
 
     output = outputs[1]
@@ -369,6 +369,7 @@ function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
         target.feedback_nodes[:] .= source.feedback_nodes
         target.parameters = deepcopy(source.parameters)
         target.state = deepcopy(source.state)
+        target.optimiser_state = deepcopy(source.optimiser_state)
         target.body = source.body
     end
 
@@ -410,35 +411,37 @@ function agentparams(n_outputs) :: AgentParams
     return (sensorParams, sizes)
 end
 
-function PredatorPrey(learning_rate, params, bounds, animal, f)
+function PredatorPrey(rng, learning_rate, params, bounds, animal, f)
     (_, sizes) = params
+    network, ps, st = randomnetwork(rng, sizes)
+    st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
+    feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     (x,y) = randompoint(bounds)
     theta = rand()*tau
-    network = randomnetwork(sizes)
-    feedback =  randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     body = Body(x,y,theta)
-    optimiser = Flux.Optimise.Adam(learning_rate)
     hunger = rand(80:100)
     health = 100
     attacking = 0
     return f(
         animal,
-        feedback,
+        feedback_nodes,
         network,
+        ps,
+        st,
         hunger,
         attacking,
         health,
         body,
-        optimiser
+        st_opt,
     )
 end
 
-function Predator(learning_rate, params, bounds) :: Predator
-    return PredatorPrey(learning_rate, params, bounds, 1, Predator)
+function Predator(rng, learning_rate, params, bounds) :: Predator
+    return PredatorPrey(rng, learning_rate, params, bounds, 1, Predator)
 end
 
-function Prey(learning_rate, params, bounds) :: Prey
-    return PredatorPrey(learning_rate, params, bounds, 2, Prey)
+function Prey(rng, learning_rate, params, bounds) :: Prey
+    return PredatorPrey(rng, learning_rate, params, bounds, 2, Prey)
 end
 
 function Food(bounds) :: Food
@@ -462,27 +465,25 @@ function draw_animals(predators :: Vector{Predator}, prey :: Vector{Prey}, food 
     return (plt, (width, height))
 end
 
-function replicatepredatorprey(source, target, params :: AgentParams, bounds :: Bounds)
-    (_, sizes) = params
-    target.optimiser.eta = source.optimiser.eta
-    target.optimiser.beta = source.optimiser.beta
-    target.optimiser.state = IdDict()
-
-    if rand() < 0.01
-        network = randomnetwork(sizes)
-        feedback = zeros(size(target.feedback_nodes))
+function replicatepredatorprey(rng, source, target, bounds :: Bounds)
+    if Random.rand(rng) < 0.01
+        ps, st = Lux.setup(rng, target.network)
+        target.parameters = ps
+        target.state = st
+        target.feedback_nodes[:] .=  zeros(size(target.feedback_nodes))
         (x,y) = randompoint(bounds)
         theta = rand()*tau
         target.body = Body(x,y,theta)
     else
-        network = source.network
-        feedback = source.feedback_nodes
+        target.network = source.network
+        target.feedback_nodes[:] .= source.feedback_nodes
+        target.parameters = deepcopy(source.parameters)
+        target.state = deepcopy(source.state)
+        target.optimiser_state = deepcopy(source.optimiser_state)
         target.body = source.body
     end
-    replicatenetwork(network, target.network)
 
-    target.feedback_nodes[:] .= feedback
-    target.hunger = rand(80:100)
+    target.hunger = Random.rand(rng, 80:100)
     target.health = 100
     target.attacking = 0
 end
@@ -553,12 +554,8 @@ end
 function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators, prey, food)
     sensors = animalsensors(agent.body, params, bounds, predators, prey, food)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    (loss, _, _, outputs), grads = train(agent.network, inputs)
-    for name in fieldnames(Network)
-        param = getfield(agent.network, name)
-        grad = grads[name] # grads[getfield(agent.network,name)]
-        Flux.update!(agent.optimiser, param, grad)
-    end
+    (loss, _, _, outputs), grads, _ = train(agent.network, inputs, agent.parameters, agent.state)
+    Optimisers.update(agent.optimiser_state, agent.parameters, grads)
 
     vfwd = tanh(outputs[1])
     vside = tanh(outputs[2])
@@ -627,8 +624,10 @@ function animals()
     bounds :: Bounds = ((0, 10), (0, 10))
     params = agentparams(3)
     (n_predators, n_prey, n_food) = (50, 100, 50)
-    predators = [Predator(1e-4, params, bounds) for _ in 1:n_predators]
-    prey = [Prey(1e-4, params, bounds) for _ in 1:n_prey]
+    rng = Random.default_rng()
+    Random.seed!(rng, 0)
+    predators = [Predator(rng, 1e-4, params, bounds) for _ in 1:n_predators]
+    prey = [Prey(rng, 1e-4, params, bounds) for _ in 1:n_prey]
     food = [Food(bounds) for _ in 1:n_food]
     last_print = 0
     while true
@@ -644,17 +643,17 @@ function animals()
                     neighbour = predators[neighbour_index]
                     retries += 1
                     if retries > 20
-                        neighbour = Predator(1e-4, params, bounds)
+                        neighbour = Predator(rng, 1e-4, params, bounds)
                         break
                     end
                 end
-                replicatepredatorprey(neighbour, predator, params, bounds)
+                replicatepredatorprey(rng, neighbour, predator, bounds)
             end
         end
         for (k, p) in enumerate(prey)
             updateanimal(p, params, bounds, predators, prey, food)
             if p.hunger <= 0 || p.health <= 0
-                neighbour_index = mod1(k+rand([-1,1]), n_prey)
+                neighbour_index = mod1(k+Random.rand(rng, [-1,1]), n_prey)
                 neighbour = prey[neighbour_index]
                 retries = 0
                 while neighbour.hunger <= 0 || neighbour.health <= 0
@@ -663,11 +662,11 @@ function animals()
                     neighbour = prey[neighbour_index]
                     retries += 1
                     if retries > 20
-                        neighbour = Prey(1e-4, params, bounds)
+                        neighbour = Prey(rng, 1e-4, params, bounds)
                         break
                     end
                 end
-                replicatepredatorprey(neighbour, p, params, bounds)
+                replicatepredatorprey(rng, neighbour, p, bounds)
             end
         end
         for (k, f) in enumerate(food)
