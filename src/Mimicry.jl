@@ -696,23 +696,28 @@ function cars()
     last_print = 0
     tpf = 0.001
     while true
-        for (k, agent) in enumerate(agents)
+        Threads.@threads for k in 1:length(agents)
+            agent = agents[k]
             updatecar(agent, params, arena)
-            alive = ontrack((agent.body.x, agent.body.y), arena)
-            if !alive
-                neighbour_index = mod1(k+rand([-1,1]),length(agents))
-                neighbour = agents[neighbour_index]
-                while !ontrack((neighbour.body.x, neighbour.body.y), arena)
+        end
+
+        alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
+
+        Threads.@threads for i in 1:length(agents)
+            if !alive[i]
+                k = i
+                neighbour = mod1(k+rand([-1,1]), length(agents))
+                while !alive[neighbour]
                     k = neighbour
-                    neighbour_index = mod1(k+rand([-1,1]),length(agents))
-                    neighbour = agents[neighbour_index]
+                    neighbour = mod1(k+rand([-1,1]), length(agents))
                 end
-                (_, sizes) = params
-                replicatecar(rng, neighbour, agent, arena)
+                @assert alive[neighbour]
+                replicatecar(rng, agents[neighbour], agents[i], arena)
             end
         end
+
         current = time_ns()
-        if current - last_print > 0.05e9
+        if current - last_print > 0.02e9
             (plt, (_, height)) = draw_scene(arena, [agent.body for agent in agents])
             println(UnicodePlots.show(plt))
             @printf "%8.1ffps                   \n" (1/(tpf/1.0e9))
