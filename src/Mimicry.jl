@@ -24,7 +24,7 @@ const Sampled = Float64
 const Parent = Int64
 
 to = TimerOutput()
-# TimerOutputs.disable_timer!(to)
+TimerOutputs.disable_timer!(to)
 
 function cleanup()
     print("\033[?25h") # show cursor
@@ -870,6 +870,23 @@ function cars()
     end
 end
 
+function grads()
+    arena = createArena()
+    params = agentparams(1)
+    rng = Random.default_rng()
+    Random.seed!(rng, 0)
+    car = Car(rng, 1e-4, params, arena)
+    sensors = sensorValues(car.body, params, arena)
+    inputs = [sensors; car.feedback_nodes*1.0]
+    code = Base.code_typed() do
+        Zygote._pullback(Zygote.Context(), p -> Lux.apply(car.network, inputs, p, car.state), car.parameters)
+    end
+    println(code)
+    # (probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
+    # sampled = @timeit to "sample from distribution" sample(probs.means, probs.logvars)
+    # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
+end
+
 function main()
     atexit(cleanup)
     (_, backup_termios) = disable_echo()
@@ -881,6 +898,8 @@ function main()
             cars()
         elseif game == "animals"
             animals()
+        elseif game == "grads"
+            grads()
         else
             cars()
         end
