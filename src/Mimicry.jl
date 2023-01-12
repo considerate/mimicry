@@ -10,6 +10,7 @@ import Optimisers
 using Printf
 import NamedTupleTools
 import Random
+using TimerOutputs
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float64}}
@@ -17,6 +18,9 @@ const Point = Tuple{Float64, Float64}
 const Polar = Tuple{Float64, Float64}
 const Bounds = Tuple{Point, Point}
 const Arena = Tuple{Polygon, Polygon, Bounds}
+
+to = TimerOutput()
+# TimerOutputs.disable_timer!(to)
 
 function cleanup()
     print("\033[?25h") # show cursor
@@ -84,6 +88,7 @@ mutable struct Predator
     parameters::NamedTuple
     state::NamedTuple
     energy::Int64 # negative energy implies death
+    age :: Float64
     attacking::Int64
     health :: Int64
     body::Body
@@ -101,6 +106,7 @@ mutable struct Prey
     parameters::NamedTuple
     state::NamedTuple
     energy::Int64
+    age :: Float64
     attacking::Int64
     health :: Int64
     body::Body
@@ -113,7 +119,7 @@ mutable struct Food
     body :: Body
 end
 
-function randomnetwork(rng, s)
+@timeit to "new network" function randomnetwork(rng, s)
     min_std_deviation = 0.01
     min_logvar = 2*log(min_std_deviation)
     network = Network(Lux.Dense(s.n1, s.n2, Lux.relu),
@@ -125,7 +131,7 @@ function randomnetwork(rng, s)
 end
 
 
-function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
+@timeit to "new car" function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
     (_, sizes) = params
     network, ps, st = randomnetwork(rng, sizes)
     st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
@@ -272,7 +278,7 @@ function disable_echo()
     return (termios, backup_termios)
 end
 
-function draw_scene(arena :: Arena, bodies :: Vector{Body})
+@timeit to "draw scene" function draw_scene(arena :: Arena, bodies :: Vector{Body})
     width = 121
     height = 44
     (outer, inner, _) = arena
@@ -298,23 +304,23 @@ function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64
     return randn(length(means)).*sigma + means
 end
 
-function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
-    (probs, st1), dforward = Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
-    sampled = sample(probs.means, probs.logvars)
-    loss, dloss = Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
-    dprob = dloss(1.0)[1]
-    grads1 = dforward((dprob, nothing))[1]
+@timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+    (probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
+    sampled = @timeit to "sample from distribution" sample(probs.means, probs.logvars)
+    loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
+    dprob = @timeit to "run loss pullback" dloss(1.0)[1]
+    grads1 = @timeit to "run network pullback" dforward((dprob, nothing))[1]
     return ((loss, probs.means, probs.logvars, sampled), grads1, st1)
 end
 
 
-function updatecar(agent::Car, params :: AgentParams, arena :: Arena)
+@timeit to "update car" function updatecar(agent::Car, params :: AgentParams, arena :: Arena)
     # possible future (micro-)optimisation: this currently updates the network
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
     inputs = [sensors; agent.feedback_nodes*1.0]
     ((loss, _, _, outputs), grads, _) = train(agent.network, inputs, agent.parameters, agent.state)
-    Optimisers.update(agent.optimiser_state, agent.parameters, grads)
+    @timeit to "optimise" Optimisers.update(agent.optimiser_state, agent.parameters, grads)
 
     output = outputs[1]
     if isnan(output)
@@ -348,28 +354,19 @@ function update(bodies, arena :: Arena)
     end
 end
 
-function replicatenetwork(source :: Network, target :: Network)
-    target.logvar_w[:,:] .= source.logvar_w
-    target.logvar_b[:] .= source.logvar_b
-    target.mean_w[:,:] .= source.mean_w
-    target.mean_b[:] .= source.mean_b
-    target.layer1_w[:,:] .= source.layer1_w
-    target.layer1_b[:] .= source.layer1_b
-end
-
-function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
+@timeit to "replicate car" function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
     if Random.rand(rng) < 0.01
         ps, st = Lux.setup(rng, target.network)
-        target.parameters = ps
-        target.state = st
-        target.feedback_nodes[:] .=  zeros(size(target.feedback_nodes))
+        replicateparams(ps, target.parameters)
+        replicateparams(st, target.state)
+        target.feedback_nodes .=  zeros(size(target.feedback_nodes))
         target.body = randomBody(arena)
     else
         target.network = source.network
-        target.feedback_nodes[:] .= source.feedback_nodes
-        target.parameters = deepcopy(source.parameters)
-        target.state = deepcopy(source.state)
-        target.optimiser_state = deepcopy(source.optimiser_state)
+        target.feedback_nodes .= source.feedback_nodes
+        replicateparams(source.parameters, target.parameters)
+        replicateparams(source.state, target.state)
+        replicateparams(source.optimiser_state, target.optimiser_state)
         target.body = source.body
     end
 
@@ -422,6 +419,7 @@ function PredatorPrey(rng, learning_rate, params, bounds, animal, f)
     energy = rand(400:500)
     health = 100
     attacking = 0
+    age = 0
     return f(
         animal,
         feedback_nodes,
@@ -429,6 +427,7 @@ function PredatorPrey(rng, learning_rate, params, bounds, animal, f)
         ps,
         st,
         energy,
+        age,
         attacking,
         health,
         body,
@@ -465,6 +464,24 @@ function draw_animals(predators :: Vector{Predator}, prey :: Vector{Prey}, food 
     return (plt, (width, height))
 end
 
+function replicateparams(source :: NamedTuple, target :: NamedTuple)
+    function replicatekey(key)
+        if !haskey(target, key)
+            return deepcopy(getfield(source, key))
+        end
+        a = getfield(source, key)
+        b = getfield(target, key)
+        if isa(a,NamedTuple) && isa(b, NamedTuple)
+            return replicateparams(a, b)
+        elseif isa(a, Array) && isa(b, Array)
+            getfield(target, key) .= getfield(source, key)
+        else
+            return deepcopy(a)
+        end
+    end
+    return NamedTuple{keys(source)}(map(replicatekey, keys(source)))
+end
+
 function replicatepredatorprey(rng, source, target, bounds :: Bounds)
     if Random.rand(rng) < 0.01
         ps, st = Lux.setup(rng, target.network)
@@ -477,9 +494,9 @@ function replicatepredatorprey(rng, source, target, bounds :: Bounds)
     else
         target.network = source.network
         target.feedback_nodes[:] .= source.feedback_nodes
-        target.parameters = deepcopy(source.parameters)
-        target.state = deepcopy(source.state)
-        target.optimiser_state = deepcopy(source.optimiser_state)
+        replicateparams(source.parameters, target.parameters)
+        replicateparams(source.state, target.state)
+        replicateparams(source.optimiser_state, target.optimiser_state)
         target.body = source.body
     end
 
@@ -636,9 +653,12 @@ function animals()
             updateanimal(predator, params, bounds, predators, prey, food)
         end
         alive = [p.energy > 0 && p.health > 0 for p in predators]
-        Threads.@threads for k in 1:length(predators)
-            predator = predators[k]
-            if !alive[k]
+        Threads.@threads for i in 1:length(predators)
+            predator = predators[i]
+            if alive[i]
+                predator.age += 1
+            else
+                k = i
                 neighbour = mod1(k+rand([-1,1]),n_predators)
                 retries = 0
                 target = predators[neighbour]
@@ -661,8 +681,11 @@ function animals()
             updateanimal(p, params, bounds, predators, prey, food)
         end
         alive = [p.energy > 0 && p.health > 0 for p in prey]
-        Threads.@threads for k in 1:length(prey)
-            if !alive[k]
+        Threads.@threads for i in 1:length(prey)
+            if alive[i]
+                prey[i].age += 1
+            else
+                k = 1
                 neighbour = mod1(k+Random.rand(rng, [-1,1]), n_prey)
                 target = prey[neighbour]
                 retries = 0
@@ -677,7 +700,7 @@ function animals()
                     end
                 end
                 @assert alive[neighbour] || retries > 20
-                replicatepredatorprey(rng, target, prey[k], bounds)
+                replicatepredatorprey(rng, target, prey[i], bounds)
             end
         end
         for (k, f) in enumerate(food)
@@ -729,11 +752,23 @@ function cars()
 
         current = time_ns()
         if current - last_print > 0.02e9
-            (plt, (_, height)) = draw_scene(arena, [agent.body for agent in agents])
-            println(UnicodePlots.show(plt))
-            @printf "%8.1ffps                   \n" (1/(tpf/1.0e9))
+            (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents])
+            if to.enabled
+                io = PipeBuffer()
+                show(IOContext(io), to)
+                stats = string(read(io, String), "\n")
+            else
+                stats = ""
+            end
+
+            chart = Base.string(plt, color=true)
+            fps = @sprintf "%8.1ffps" (1/(tpf/1.0e9))
+            output = string(chart, "\n", stats, fps, "\n")
+            lines = countlines(IOBuffer(output))
+            print("\033[J") # clear to end of screen
+            print(output)
             print("\033[s") # save cursor
-            print(string("\033[",height+3,"A")) # move up height+3 lines
+            print(string("\033[",lines,"A"))
             last_print = current
         end
         diff = current - prev
@@ -759,6 +794,9 @@ function main()
             cars()
         end
     catch e
+        if isa(e, TaskFailedException)
+            e = e.task.exception
+        end
         if isa(e, Core.InterruptException)
             println("\033[uexiting")
         else
