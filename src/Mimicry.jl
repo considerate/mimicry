@@ -12,6 +12,7 @@ import NamedTupleTools
 import Random
 using TimerOutputs
 import LinearAlgebra
+import ColorSchemes
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float64}}
@@ -125,7 +126,7 @@ function activation_grad(::typeof(logvar_activation), y, dy)
     return dy
 end
 
-@timeit to "dense_forward" function dense_forward(_ :: Lux.Dense, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
+@inline function dense_forward(_ :: Lux.Dense, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
     #(y, st) = layer(x, ps, st)
     memory.x .= x
     LinearAlgebra.mul!(memory.y, ps.weight, x)
@@ -133,7 +134,7 @@ end
     return memory.y, nothing
 end
 
-@timeit to "dense_back" function dense_back(layer :: Lux.Dense, dy :: AbstractArray, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
+@inline function dense_back(layer :: Lux.Dense, dy :: AbstractArray, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
     dy = activation_grad(layer.activation, memory.y, dy)
     grads.weight .= dy .* memory.x'
     # LinearAlgebra.kron!(grads.weight, dy, memory.x)
@@ -141,17 +142,17 @@ end
     LinearAlgebra.mul!(grads.inputs, transpose(ps.weight), dy)
 end
 
-@timeit to "network_forward" function network_forward(network :: Network, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
+@inline function network_forward(network :: Network, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
     (y, st_dense) = dense_forward(network.dense, x, ps.dense, st.dense, memory.dense)
     (mu, st_mean) = dense_forward(network.means, y, ps.means, st.means, memory.means)
     (sigma, st_logvar) = dense_forward(network.logvars, y, ps.logvars, st.logvars, memory.logvars)
     return (means=mu, logvars=sigma), (dense=st_dense, means=st_mean, logvars=st_logvar)
 end
 
-@timeit to "network_back" function network_back(network :: Network, dout :: NamedTuple, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
+@inline function network_back(network :: Network, dout :: NamedTuple, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
     dense_back(network.logvars, dout.logvars, ps.logvars, grads.logvars, memory.logvars)
     dense_back(network.means, dout.means, ps.means, grads.logvars, memory.means)
-    grads.y .+= grads.logvars.inputs
+    grads.y .= grads.logvars.inputs
     grads.y .+= grads.means.inputs
     dense_back(network.dense, grads.y, ps.dense, grads.dense, memory.dense)
 end
@@ -231,7 +232,7 @@ mutable struct Food
 end
 
 
-@timeit to "new network" function randomnetwork(rng, s)
+function randomnetwork(rng, s)
     network = Network(Lux.Dense(s.n1, s.n2, Lux.relu),
                       Lux.Dense(s.n2, s.n3),
                       Lux.Dense(s.n2, s.n3, logvar_activation),
@@ -251,13 +252,13 @@ function walk_nested(f, x)
 end
 
 function zero_grads(grads :: NamedTuple)
-    walk_nested(x -> x .= zero(x), grads)
+    walk_nested(x -> x .= 0, grads)
 end
 
-@timeit to "new car" function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
+function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
     (_, sizes) = params
     network, ps, st = randomnetwork(rng, sizes)
-    st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
+    st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
     feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     loss = GaussLoss(sizes.n3)
     nop = NamedTuple()
@@ -280,13 +281,7 @@ end
     )
 end
 
-
-function gaussloss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vector{Float64}) ::Float64
-    losses = (outputs.-means).^2 .* exp.(.-logvars) .+ logvars
-    return 0.5*Lux.mean(losses)
-end
-
-@timeit to "gaussloss_forward" function gaussloss_forward(_ :: GaussLoss, means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64}, memory :: NamedTuple)
+@inline function gaussloss_forward(_ :: GaussLoss, means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64}, memory :: NamedTuple)
     memory.diffs .= (means.-outputs)
     memory.inv_vars .= exp.(.-logvars)
     memory.logvars .= logvars
@@ -295,22 +290,9 @@ end
     return 0.5*Lux.mean(memory.losses)
 end
 
-@timeit to "gaussloss_back" function gaussloss_back(_ :: GaussLoss, dloss :: Float64, grads :: NamedTuple, memory :: NamedTuple)
+@inline function gaussloss_back(_ :: GaussLoss, dloss :: Float64, grads :: NamedTuple, memory :: NamedTuple)
     grads.means .= (2 * dloss) .* memory.diffs
     grads.logvars .= (memory.diffs.^2 .* memory.inv_vars .* memory.logvars .* (-dloss)) .+ dloss
-end
-
-# TODO: optimize with pre-allocated tape/memory
-function gaussloss_pb(means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64})
-    diffs = (means.-outputs)
-    squared_diffs = diffs.^2
-    z = exp.(.-logvars)
-    losses = squared_diffs .* z .+ logvars
-    pb = function(dloss :: Float64, grads :: NamedTuple)
-        grads.means .= (2 * dloss) .* diffs
-        grads.logvars .= (squared_diffs .* z .* logvars .* (-dloss)) .+ dloss
-    end
-    return 0.5*Lux.mean(losses), pb
 end
 
 function divergenceloss(output::Prob, target::Prob) ::Float64
@@ -452,7 +434,7 @@ function disable_echo()
     return (termios, backup_termios)
 end
 
-@timeit to "draw scene" function draw_scene(arena :: Arena, bodies :: Vector{Body})
+@timeit to "draw scene" function draw_scene(arena :: Arena, bodies :: Vector{Body}, ages :: Vector{Int64})
     width = 121
     height = 44
     (outer, inner, _) = arena
@@ -463,8 +445,15 @@ end
     for (before, after) in zip(inner[1:end-1], inner[2:end])
         UnicodePlots.lines!(canvas, before[1], before[2], after[1], after[2]; color=:cyan)
     end
+    colors=get(ColorSchemes.hawaii,ages,(0.0,500.0))
+    for i in eachindex(bodies)
+        b = bodies[i]
+        c = colors[i]
+        col = (round(Int,c.r *255), round(Int,c.g * 255), round(Int,c.b * 255))
+        UnicodePlots.points!(canvas, b.x, b.y, color=col)
+    end
     plt = UnicodePlots.Plot(canvas)
-    UnicodePlots.scatterplot!(plt, [b.x for b in bodies], [b.y for b in bodies], width=80, height=height)
+    # UnicodePlots.scatterplot!(plt, [b.x for b in bodies], [b.y for b in bodies], width=80, height=height, color=colors)
     return (plt, (width, height))
 end
 
@@ -520,7 +509,7 @@ end
     inputs = [sensors; agent.feedback_nodes*1.0]
     ((loss, means, logvars, outputs), grads, _) = train(agent.network, agent.loss, inputs, agent.parameters, agent.state, agent.gradients, agent.memory)
     @timeit to "optimise" Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
-    @timeit to "zero_grad" zero_grads(agent.gradients)
+    # @timeit to "zero_grad" zero_grads(agent.gradients)
 
     output = outputs[1]
     if isnan(output)
@@ -936,13 +925,14 @@ function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Ar
 end
 
 function cars()
+    Base.start_reading(stdin)
     started = time_ns()
     arena = createArena()
     params = agentparams(1)
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, 1e-3, params, arena) for _ in 1:pop_size]
+    agents = [Car(rng, 3e-4, params, arena) for _ in 1:pop_size]
     history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
     prev = time_ns()
     last_print = 0
@@ -950,6 +940,8 @@ function cars()
     results = Vector{Tuple{Prob,Sampled}}(undef,(length(agents),))
     parents = [i for i in 1:length(agents)]
     frame = 0
+    realtime = false
+    target_fps = 30
     while true
         Threads.@threads for k in 1:length(agents)
             agent = agents[k]
@@ -1015,7 +1007,8 @@ function cars()
 
         current = time_ns()
         if current - last_print > 0.05e9
-            (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents])
+            ages = [agent.age for agent in agents]
+            (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents], ages)
             if to.enabled
                 io = PipeBuffer()
                 show(IOContext(io), to)
@@ -1025,13 +1018,13 @@ function cars()
             end
 
             chart = Base.string(plt, color=true)
-            ages = [agent.age for agent in agents]
             mean_age = sum(ages) / length(agents)
             max_age = maximum(ages)
             longest_lineage = maximum([agent.lineage for agent in agents])
             elapsed = current - started
             full_fps =1/(elapsed/(frame*1e9))
-            summary = @sprintf "%8.1ffps mean: %7.1ffps age: %5.2f max age: %d longest lineage: %d frame: %d" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame
+            is_realtime = realtime ? "true" : "false"
+            summary = @sprintf "%8.1ffps mean: %7.1ffps age: %5.2f max age: %d longest lineage: %d frame: %d realtime %s" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
             output = string(chart, "\n", profiling, summary, "\n", hist, "\n")
             lines = countlines(IOBuffer(output))
@@ -1042,6 +1035,17 @@ function cars()
             last_print = current
         end
         diff = current - prev
+        target_step = prev + 1/target_fps * 1e9
+        bb = bytesavailable(stdin)
+        if bb > 0
+            data = read(stdin, bb)
+            if data[1] == UInt(32)
+                realtime = !realtime
+            end
+        end
+        if realtime && current < target_step
+            sleep((target_step - current)/1e9)
+        end
         seconds = diff/1.0e9
         alpha = 1 - exp(-0.001*seconds)
         tpf = tpf * alpha + (1 - alpha) * diff
@@ -1067,9 +1071,18 @@ function grads()
     # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
 end
 
+const F_GETFL = Cint(3)
+const F_SETFL = Cint(4)
+const O_NONBLOCK = Cint(0o00004000)
+
 function main()
     atexit(cleanup)
+    s :: RawFD = RawFD(Base.Core.Integer(0))
+    flags = ccall(:fcntl, Cint, (RawFD, Cint, Cint...), s, F_GETFL)
+    flags2=flags | O_NONBLOCK
+    println()
     (_, backup_termios) = disable_echo()
+    ccall(:fcntl, Cint, (RawFD, Cint, Cint...), s, F_SETFL, flags2)
     print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
     game = ARGS[1]
