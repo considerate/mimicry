@@ -24,7 +24,7 @@ const Sampled = Float64
 const Parent = Int64
 
 to = TimerOutput()
-TimerOutputs.disable_timer!(to)
+# TimerOutputs.disable_timer!(to)
 
 function cleanup()
     print("\033[?25h") # show cursor
@@ -81,6 +81,7 @@ mutable struct Car
     state::NamedTuple
     body::Body
     optimiser_state :: NamedTuple
+    gradients :: NamedTuple
 end
 
 # A Predator decides:
@@ -137,11 +138,27 @@ end
 end
 
 
+function walk_nested(f, nt :: NamedTuple)
+    for x in nt
+        walk_nested(f, x)
+    end
+end
+function walk_nested(f, x)
+    f(x)
+end
+
+function zero_grads(grads :: NamedTuple)
+    walk_nested(x -> x .= zero(x), grads)
+end
+
 @timeit to "new car" function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
     (_, sizes) = params
     network, ps, st = randomnetwork(rng, sizes)
     st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
     feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
+    loss_grads =(means=zeros(Float64, sizes.n3),logvars=zeros(Float64, sizes.n3))
+    grads = (; deepcopy(ps)..., loss=loss_grads)
+    zero_grads(grads)
     age = 0
     lineage = 0
     return Car(
@@ -153,19 +170,33 @@ end
         st,
         randomBody(arena),
         st_opt,
+        grads,
     )
 end
 
+
 function gaussloss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vector{Float64}) ::Float64
-    squared_deviations = (outputs-means).^2
-    gaussian_loss = 0.5*sum(squared_deviations .* exp.(-logvars) + logvars)/length(outputs)
-    return gaussian_loss #+ 0.01*l2(net)
+    losses = (outputs.-means).^2 .* exp.(.-logvars) .+ logvars
+    return 0.5*Lux.mean(losses)
+end
+
+# TODO: optimize with pre-allocated tape/memory
+function gaussloss_pb(means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64}, grads::NamedTuple)
+    diffs = (means.-outputs)
+    squared_diffs = diffs.^2
+    z = exp.(.-logvars)
+    losses = squared_diffs .* z .+ logvars
+    pb = function(dloss :: Float64)
+        grads.means .= (2 * dloss) .* diffs
+        grads.logvars .= (squared_diffs .* z .* logvars .* (-dloss)) .+ dloss
+    end
+    return 0.5*Lux.mean(losses), pb
 end
 
 function divergenceloss(output::Prob, target::Prob) ::Float64
     (means,logvars) = output
     (target_means, target_logvars) = target
-    mean_diffs = (means .- target_means).^2
+    mean_diffs = (means - target_means).^2
     function kldiv(i)
         s1 = exp(logvars[i])
         s2 = exp(target_logvars[i])
@@ -205,12 +236,12 @@ function turn(b :: Body, amount)
 end
 
 
-function moveForward(b::Body)
+function moveForward(rng :: Random.AbstractRNG, b::Body)
     speed = 0.05;
 
     return Body(
-        b.x + speed*sin(b.theta),
-        b.y + speed*cos(b.theta),
+        b.x + speed*sin(b.theta) + Random.randn(rng) * 0.001,
+        b.y + speed*cos(b.theta) + Random.randn(rng) * 0.001,
         b.theta,
     )
 end
@@ -327,14 +358,29 @@ function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64
     return randn(length(means)).*sigma + means
 end
 
-@timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+@timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple, grads::NamedTuple)::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
     (probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
     sampled = @timeit to "sample from distribution" sample(probs.means, probs.logvars)
-    loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
-    dprob = @timeit to "run loss pullback" dloss(1.0)[1]
-    grads1 = @timeit to "run network pullback" dforward((dprob, nothing))[1]
+    loss, dloss = gaussloss_pb(probs.means, probs.logvars, sampled, grads.loss)
+    # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
+    @timeit to "run loss pullback" dloss(1.0)
+    grads1 = @timeit to "run network pullback" dforward((grads.loss, nothing))[1]
     return ((loss, probs.means, probs.logvars, sampled), grads1, st1)
 end
+
+# @timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+#     function model(p)
+#         (probs, st1) = Lux.apply(net, inputs, p, st)
+#         sampled = Zygote.dropgrad(sample(probs.means, probs.logvars))
+#         loss = gaussloss(probs.means, probs.logvars, sampled)
+#         return (loss, probs, sampled, st1)
+#     end
+#
+#     results, dmodel = @timeit to "pullback network" Zygote.pullback(model, ps)
+#     (loss, probs, sampled, st1) = results
+#     grads1 = @timeit to "run network pullback" dmodel((1, nothing, nothing, nothing))[1]
+#     return ((loss, probs.means, probs.logvars, sampled), grads1, st1)
+# end
 
 function update_feedback(feedback_nodes, feedback)
     mem_decay_times = exp.(range(
@@ -346,12 +392,12 @@ function update_feedback(feedback_nodes, feedback)
 end
 
 
-@timeit to "update car" function updatecar(agent::Car, params :: AgentParams, arena :: Arena)
+@timeit to "update car" function updatecar(rng, agent::Car, params :: AgentParams, arena :: Arena)
     # possible future (micro-)optimisation: this currently updates the network
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    ((loss, means, logvars, outputs), grads, _) = train(agent.network, inputs, agent.parameters, agent.state)
+    ((loss, means, logvars, outputs), grads, _) = train(agent.network, inputs, agent.parameters, agent.state, agent.gradients)
     @timeit to "optimise" Optimisers.update(agent.optimiser_state, agent.parameters, grads)
 
     output = outputs[1]
@@ -363,7 +409,7 @@ end
     end
     feedback = outputs[2:end]
     agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
-    agent.body = moveForward(turn(agent.body,output))
+    agent.body = moveForward(rng, turn(agent.body,output))
     return (loss, means, logvars, outputs)
 end
 
@@ -653,6 +699,7 @@ function animals()
     prey = [Prey(rng, 1e-4, params, bounds) for _ in 1:n_prey]
     food = [Food(bounds) for _ in 1:n_food]
     last_print = 0
+    history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
     while true
         Threads.@threads for k in 1:length(predators)
             predator = predators[k]
@@ -727,15 +774,16 @@ end
 
 
 
-@timeit to "train_mimic" function train_mimic(agent :: Car, inputs :: Vector{Float64}, targets :: Prob)
+@timeit to "train_mimic" function train_mimic(agent, inputs :: Vector{Float64}, targets :: Prob)
     (probs, _), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(agent.network, inputs, p, agent.state), agent.parameters)
     _, dloss = @timeit to "pullback loss" Zygote.pullback(p -> divergenceloss((p.means, p.logvars), targets), probs)
     dprob = @timeit to "run loss pullback" dloss(1.0)[1]
     grads = @timeit to "run network pullback" dforward((dprob, nothing))[1]
     @timeit to "optimise" Optimisers.update(agent.optimiser_state, agent.parameters, grads)
+    return probs
 end
 
-function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Array{Tuple{Prob,Float64,Body}})
+function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Array{Tuple{Prob,Body}})
     mid = length(trajectory) ÷ 2
     if mid == 0
         return
@@ -744,19 +792,22 @@ function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Ar
     warmup = trajectory[1:mid]
     training = trajectory[mid+1:end]
     # replay trajectory to warm up feedback_nodes
-    for (_, _, body) in warmup
+    for (_, body) in warmup
         sensors = sensorValues(body, params, arena)
         inputs = [sensors; agent.feedback_nodes*1.0]
         prob, _ = agent.network(inputs, agent.parameters, agent.state)
         outputs = sample(prob.means, prob.logvars)
         feedback = outputs[2:end]
-        update_feedback(agent.feedback_nodes, feedback)
+        agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
     end
-    for (prob, _, body) in training
+    for (prob, body) in training
         sensors = sensorValues(body, params, arena)
         inputs = [sensors; agent.feedback_nodes*1.0]
         # train on last step of trajectory
-        train_mimic(agent, inputs, prob)
+        probs = train_mimic(agent, inputs, prob)
+        outputs = sample(probs.means, probs.logvars)
+        feedback = outputs[2:end]
+        agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
     end
     # revert feedback_nodes for the agent
     agent.feedback_nodes .= original_feedback
@@ -781,7 +832,7 @@ function cars()
             agent = agents[k]
             agent.age += 1
             agent.lineage += 1
-            (_, means, logvars, sampled) = updatecar(agent, params, arena)
+            (_, means, logvars, sampled) = updatecar(rng, agent, params, arena)
             results[k] = (means, logvars), sampled[1]
         end
 
@@ -813,18 +864,21 @@ function cars()
         if length(history) > 100
             pop!(history)
         end
-        mimic_probability = 0.001
+        mimic_probability = 0.01
         tasks = []
         for k in 1:length(agents)
             if rand() < mimic_probability
                 t = Threads.@spawn begin
                     agent = agents[k]
-                    trajectory :: Array{Tuple{Prob, Float64, Body}} = []
-                    # index = argmax([agent.age for agent in agents])
-                    index = rand(1:pop_size)
+                    trajectory :: Array{Tuple{Prob, Body}} = []
+                    index = argmax([agent.age for agent in agents])
+                    #index = rand(1:pop_size)
+                    while index == k
+                        index = rand(1:pop_size)
+                    end
                     for t in 1:length(history)
-                        prob, sampled, body, parent = history[t][index]
-                        pushfirst!(trajectory, (prob, sampled, body))
+                        prob, _, body, parent = history[t][index]
+                        pushfirst!(trajectory, (prob, body))
                         index = parent
                     end
                     mimic(agent, params, arena, trajectory)
@@ -853,7 +907,8 @@ function cars()
             max_age = maximum(ages)
             longest_lineage = maximum([agent.lineage for agent in agents])
             summary = @sprintf "%8.1ffps age: %5.2f max age: %d longest lineage: %d frame: %d" (1/(tpf/1.0e9)) mean_age max_age longest_lineage frame
-            output = string(chart, "\n", profiling, summary, "\n")
+            hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
+            output = string(chart, "\n", profiling, summary, "\n", hist, "\n")
             lines = countlines(IOBuffer(output))
             print("\033[J") # clear to end of screen
             print(output)
