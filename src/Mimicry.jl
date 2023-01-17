@@ -24,7 +24,7 @@ const Sampled = Float64
 const Parent = Int64
 
 to = TimerOutput()
-# TimerOutputs.disable_timer!(to)
+TimerOutputs.disable_timer!(to)
 
 function cleanup()
     print("\033[?25h") # show cursor
@@ -46,11 +46,85 @@ function Lux.initialstates(rng::Random.AbstractRNG, network :: Network)
     return Lux.initialstates(rng, layers)
 end
 
+#TODO: write initialgradients function
+
+function initialgradients(layer :: Lux.Dense{use_bias}, ps :: NamedTuple) where {use_bias}
+    if use_bias
+        return (inputs=zeros(Float64,layer.in_dims), weight=zero(ps.weight), bias=zero(ps.bias))
+    else
+        return (inputs=zeros(Float64,layer.in_dims), weight=zero(ps.weight))
+    end
+end
+
+function initialgradients(network :: Network, ps :: NamedTuple)
+    means_grads=initialgradients(network.means, ps.means)
+    return (dense=initialgradients(network.dense, ps.dense),
+            means=means_grads,
+            logvars=initialgradients(network.logvars, ps.logvars),
+            y=zero(means_grads.inputs),
+            )
+end
+
+
 @inline function (network::Network)(x :: AbstractArray, ps :: NamedTuple, st::NamedTuple)
     y, st_dense = network.dense(x, ps.dense, st.dense)
     mu, st_mean = network.means(y, ps.means, st.means)
     sigma, st_logvar = network.logvars(y, ps.logvars, st.logvars)
     return (means=mu, logvars=sigma), (dense=st_dense, mean=st_mean, logvar=st_logvar)
+end
+
+function logvar_activation(x)
+    min_std_deviation = 0.01
+    min_logvar = 2*log(min_std_deviation)
+    return max.(x, min_logvar)
+end
+
+function activation_grad(::typeof(Lux.identity), y, dy)
+    return dy
+end
+function activation_grad(::typeof(Lux.relu), y, dy)
+    for i in 1:length(y)
+        if y[i] <= 0
+            dy[i] = 0
+        end
+    end
+    return dy
+end
+function activation_grad(::typeof(logvar_activation), y, dy)
+    min_std_deviation = 0.01
+    min_logvar = 2*log(min_std_deviation)
+    for i in 1:length(y)
+        if y[i] <= min_logvar
+            dy[i] = 0
+        end
+    end
+    return dy
+end
+
+function dense_pb(layer :: Lux.Dense, x :: AbstractArray, ps :: NamedTuple, st ::NamedTuple)
+    (y, st) = layer(x, ps, st)
+    pb = function(dy, grads :: NamedTuple)
+        dy = activation_grad(layer.activation, y, dy)
+        grads.weight .= dy .* x'
+        grads.bias .= dy
+        grads.inputs .= transpose(ps.weight) * dy
+    end
+    return (y, st), pb
+end
+
+function network_pb(network ::Network, x :: AbstractArray, ps :: NamedTuple, st ::NamedTuple)
+    (y, st_dense), dy = dense_pb(network.dense, x, ps.dense, st.dense)
+    (mu, st_mean), dmu = dense_pb(network.means, y, ps.means, st.means)
+    (sigma, st_logvar), dsigma = dense_pb(network.logvars, y, ps.logvars, st.logvars)
+    pb = function(dout ::NamedTuple, grads :: NamedTuple)
+        dsigma(dout.logvars, grads.logvars)
+        dmu(dout.means, grads.means)
+        grads.y .= grads.logvars.inputs
+        grads.y .+= grads.means.inputs
+        dy(grads.y, grads.dense)
+    end
+    out = (means=mu, logvars=sigma)
+    return (out, (dense=st_dense, mean=st_mean, logvar=st_logvar)), pb
 end
 
 
@@ -126,12 +200,11 @@ mutable struct Food
     body :: Body
 end
 
+
 @timeit to "new network" function randomnetwork(rng, s)
-    min_std_deviation = 0.01
-    min_logvar = 2*log(min_std_deviation)
     network = Network(Lux.Dense(s.n1, s.n2, Lux.relu),
                       Lux.Dense(s.n2, s.n3),
-                      Lux.Dense(s.n2, s.n3, x -> max.(x, min_logvar)),
+                      Lux.Dense(s.n2, s.n3, logvar_activation),
                      )
     ps, st = Lux.setup(rng, network)
     return network, ps, st
@@ -157,7 +230,7 @@ end
     st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
     feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     loss_grads =(means=zeros(Float64, sizes.n3),logvars=zeros(Float64, sizes.n3))
-    grads = (; deepcopy(ps)..., loss=loss_grads)
+    grads = (network=initialgradients(network, ps), loss=loss_grads)
     zero_grads(grads)
     age = 0
     lineage = 0
@@ -181,12 +254,12 @@ function gaussloss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vect
 end
 
 # TODO: optimize with pre-allocated tape/memory
-function gaussloss_pb(means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64}, grads::NamedTuple)
+function gaussloss_pb(means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64})
     diffs = (means.-outputs)
     squared_diffs = diffs.^2
     z = exp.(.-logvars)
     losses = squared_diffs .* z .+ logvars
-    pb = function(dloss :: Float64)
+    pb = function(dloss :: Float64, grads :: NamedTuple)
         grads.means .= (2 * dloss) .* diffs
         grads.logvars .= (squared_diffs .* z .* logvars .* (-dloss)) .+ dloss
     end
@@ -359,13 +432,14 @@ function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64
 end
 
 @timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple, grads::NamedTuple)::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
-    (probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
+    (probs, st1), dforward = @timeit to "compute network pullback" network_pb(net,inputs,ps,st)
+    #(probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
     sampled = @timeit to "sample from distribution" sample(probs.means, probs.logvars)
-    loss, dloss = @timeit to "compute loss pullback" gaussloss_pb(probs.means, probs.logvars, sampled, grads.loss)
+    loss, dloss = @timeit to "compute loss pullback" gaussloss_pb(probs.means, probs.logvars, sampled)
     # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
-    @timeit to "run loss pullback" dloss(1.0)
-    grads1 = @timeit to "run network pullback" dforward((grads.loss, nothing))[1]
-    return ((loss, probs.means, probs.logvars, sampled), grads1, st1)
+    @timeit to "run loss pullback" dloss(1.0, grads.loss)
+    @timeit to "run network pullback" dforward(grads.loss, grads.network)
+    return ((loss, probs.means, probs.logvars, sampled), grads.network, st1)
 end
 
 # @timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
@@ -864,7 +938,7 @@ function cars()
         if length(history) > 100
             pop!(history)
         end
-        mimic_probability = 0.01
+        mimic_probability = 0 # 0.01
         tasks = []
         for k in 1:length(agents)
             if rand() < mimic_probability
