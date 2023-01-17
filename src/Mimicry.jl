@@ -11,6 +11,7 @@ using Printf
 import NamedTupleTools
 import Random
 using TimerOutputs
+import LinearAlgebra
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float64}}
@@ -34,6 +35,10 @@ struct Network <: Lux.AbstractExplicitLayer
     dense :: Lux.Dense
     means :: Lux.Dense
     logvars :: Lux.Dense
+end
+
+struct GaussLoss
+    size :: Int64
 end
 
 function Lux.initialparameters(rng::Random.AbstractRNG, network :: Network)
@@ -63,6 +68,25 @@ function initialgradients(network :: Network, ps :: NamedTuple)
             logvars=initialgradients(network.logvars, ps.logvars),
             y=zero(means_grads.inputs),
             )
+end
+function initialgradients(l :: GaussLoss, _ :: NamedTuple)
+    return (means=zeros(Float64, l.size), logvars=zeros(Float64, l.size))
+end
+
+# TODO: There's an optimization to be had with aliasing between memories of different layers. For now, we'll over-allocate a bit for the sake of simplicity.
+function initialmemory(layer :: Lux.Dense, _ :: NamedTuple)
+    return (x=zeros(Float64,layer.in_dims),y=zeros(Float64,layer.out_dims))
+end
+
+function initialmemory(network :: Network, ps :: NamedTuple)
+    return (dense=initialmemory(network.dense, ps.dense),
+            means=initialmemory(network.means, ps.means),
+            logvars=initialmemory(network.logvars, ps.logvars),
+            )
+end
+
+function initialmemory(l :: GaussLoss, _ :: NamedTuple)
+    return (inv_vars=zeros(Float64, l.size), logvars=zeros(Float64, l.size), diffs=zeros(Float64, l.size), losses=zeros(Float64, l.size))
 end
 
 
@@ -101,32 +125,36 @@ function activation_grad(::typeof(logvar_activation), y, dy)
     return dy
 end
 
-function dense_pb(layer :: Lux.Dense, x :: AbstractArray, ps :: NamedTuple, st ::NamedTuple)
-    (y, st) = layer(x, ps, st)
-    pb = function(dy, grads :: NamedTuple)
-        dy = activation_grad(layer.activation, y, dy)
-        grads.weight .= dy .* x'
-        grads.bias .= dy
-        grads.inputs .= transpose(ps.weight) * dy
-    end
-    return (y, st), pb
+@timeit to "dense_forward" function dense_forward(_ :: Lux.Dense, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
+    #(y, st) = layer(x, ps, st)
+    memory.x .= x
+    LinearAlgebra.mul!(memory.y, ps.weight, x)
+    memory.y .+= ps.bias
+    return memory.y, nothing
 end
 
-function network_pb(network ::Network, x :: AbstractArray, ps :: NamedTuple, st ::NamedTuple)
-    (y, st_dense), dy = dense_pb(network.dense, x, ps.dense, st.dense)
-    (mu, st_mean), dmu = dense_pb(network.means, y, ps.means, st.means)
-    (sigma, st_logvar), dsigma = dense_pb(network.logvars, y, ps.logvars, st.logvars)
-    pb = function(dout ::NamedTuple, grads :: NamedTuple)
-        dsigma(dout.logvars, grads.logvars)
-        dmu(dout.means, grads.means)
-        grads.y .= grads.logvars.inputs
-        grads.y .+= grads.means.inputs
-        dy(grads.y, grads.dense)
-    end
-    out = (means=mu, logvars=sigma)
-    return (out, (dense=st_dense, mean=st_mean, logvar=st_logvar)), pb
+@timeit to "dense_back" function dense_back(layer :: Lux.Dense, dy :: AbstractArray, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
+    dy = activation_grad(layer.activation, memory.y, dy)
+    grads.weight .= dy .* memory.x'
+    # LinearAlgebra.kron!(grads.weight, dy, memory.x)
+    grads.bias .= dy
+    LinearAlgebra.mul!(grads.inputs, transpose(ps.weight), dy)
 end
 
+@timeit to "network_forward" function network_forward(network :: Network, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
+    (y, st_dense) = dense_forward(network.dense, x, ps.dense, st.dense, memory.dense)
+    (mu, st_mean) = dense_forward(network.means, y, ps.means, st.means, memory.means)
+    (sigma, st_logvar) = dense_forward(network.logvars, y, ps.logvars, st.logvars, memory.logvars)
+    return (means=mu, logvars=sigma), (dense=st_dense, means=st_mean, logvars=st_logvar)
+end
+
+@timeit to "network_back" function network_back(network :: Network, dout :: NamedTuple, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
+    dense_back(network.logvars, dout.logvars, ps.logvars, grads.logvars, memory.logvars)
+    dense_back(network.means, dout.means, ps.means, grads.logvars, memory.means)
+    grads.y .+= grads.logvars.inputs
+    grads.y .+= grads.means.inputs
+    dense_back(network.dense, grads.y, ps.dense, grads.dense, memory.dense)
+end
 
 struct Sizes
     n1 :: Int64
@@ -151,11 +179,13 @@ mutable struct Car
     lineage :: Int64
     feedback_nodes::Vector{Float64} # n_feedback_nodes
     network::Network
+    loss :: GaussLoss
     parameters::NamedTuple
     state::NamedTuple
     body::Body
     optimiser_state :: NamedTuple
     gradients :: NamedTuple
+    memory :: NamedTuple
 end
 
 # A Predator decides:
@@ -229,9 +259,10 @@ end
     network, ps, st = randomnetwork(rng, sizes)
     st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
     feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
-    loss_grads =(means=zeros(Float64, sizes.n3),logvars=zeros(Float64, sizes.n3))
-    grads = (network=initialgradients(network, ps), loss=loss_grads)
-    zero_grads(grads)
+    loss = GaussLoss(sizes.n3)
+    nop = NamedTuple()
+    grads = (network=initialgradients(network, ps), loss=initialgradients(loss, nop))
+    memory = (network=initialmemory(network, ps), loss=initialmemory(loss, nop))
     age = 0
     lineage = 0
     return Car(
@@ -239,11 +270,13 @@ end
         lineage,
         feedback_nodes,
         network,
+        loss,
         ps,
         st,
         randomBody(arena),
         st_opt,
         grads,
+        memory,
     )
 end
 
@@ -251,6 +284,20 @@ end
 function gaussloss(means::Vector{Float64},logvars::Vector{Float64},outputs::Vector{Float64}) ::Float64
     losses = (outputs.-means).^2 .* exp.(.-logvars) .+ logvars
     return 0.5*Lux.mean(losses)
+end
+
+@timeit to "gaussloss_forward" function gaussloss_forward(_ :: GaussLoss, means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64}, memory :: NamedTuple)
+    memory.diffs .= (means.-outputs)
+    memory.inv_vars .= exp.(.-logvars)
+    memory.logvars .= logvars
+    memory.losses .= memory.logvars
+    memory.losses .+= memory.diffs.^2 .* memory.inv_vars
+    return 0.5*Lux.mean(memory.losses)
+end
+
+@timeit to "gaussloss_back" function gaussloss_back(_ :: GaussLoss, dloss :: Float64, grads :: NamedTuple, memory :: NamedTuple)
+    grads.means .= (2 * dloss) .* memory.diffs
+    grads.logvars .= (memory.diffs.^2 .* memory.inv_vars .* memory.logvars .* (-dloss)) .+ dloss
 end
 
 # TODO: optimize with pre-allocated tape/memory
@@ -313,8 +360,8 @@ function moveForward(rng :: Random.AbstractRNG, b::Body)
     speed = 0.05;
 
     return Body(
-        b.x + speed*sin(b.theta) + Random.randn(rng) * 0.001,
-        b.y + speed*cos(b.theta) + Random.randn(rng) * 0.001,
+        b.x + speed*sin(b.theta), # + Random.randn(rng) * 0.001,
+        b.y + speed*cos(b.theta), # + Random.randn(rng) * 0.001,
         b.theta,
     )
 end
@@ -431,14 +478,14 @@ function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64
     return randn(length(means)).*sigma + means
 end
 
-@timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple, grads::NamedTuple)::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
-    (probs, st1), dforward = @timeit to "compute network pullback" network_pb(net,inputs,ps,st)
+@timeit to "train" function train(net::Network, l :: GaussLoss, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple,  grads::NamedTuple, memory :: NamedTuple)::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+    (probs, st1) = network_forward(net,inputs,ps,st, memory.network)
     #(probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
-    sampled = @timeit to "sample from distribution" sample(probs.means, probs.logvars)
-    loss, dloss = @timeit to "compute loss pullback" gaussloss_pb(probs.means, probs.logvars, sampled)
+    sampled = sample(probs.means, probs.logvars)
+    loss = gaussloss_forward(l, probs.means, probs.logvars, sampled, memory.loss)
     # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
-    @timeit to "run loss pullback" dloss(1.0, grads.loss)
-    @timeit to "run network pullback" dforward(grads.loss, grads.network)
+    gaussloss_back(l, 1.0, grads.loss, memory.loss)
+    network_back(net, grads.loss, ps, grads.network, memory.network)
     return ((loss, probs.means, probs.logvars, sampled), grads.network, st1)
 end
 
@@ -471,8 +518,9 @@ end
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
     inputs = [sensors; agent.feedback_nodes*1.0]
-    ((loss, means, logvars, outputs), grads, _) = train(agent.network, inputs, agent.parameters, agent.state, agent.gradients)
-    @timeit to "optimise" Optimisers.update(agent.optimiser_state, agent.parameters, grads)
+    ((loss, means, logvars, outputs), grads, _) = train(agent.network, agent.loss, inputs, agent.parameters, agent.state, agent.gradients, agent.memory)
+    @timeit to "optimise" Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
+    @timeit to "zero_grad" zero_grads(agent.gradients)
 
     output = outputs[1]
     if isnan(output)
@@ -888,12 +936,13 @@ function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Ar
 end
 
 function cars()
+    started = time_ns()
     arena = createArena()
     params = agentparams(1)
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, 1e-4, params, arena) for _ in 1:pop_size]
+    agents = [Car(rng, 1e-3, params, arena) for _ in 1:pop_size]
     history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
     prev = time_ns()
     last_print = 0
@@ -965,7 +1014,7 @@ function cars()
         end
 
         current = time_ns()
-        if current - last_print > 0.02e9
+        if current - last_print > 0.05e9
             (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents])
             if to.enabled
                 io = PipeBuffer()
@@ -980,7 +1029,9 @@ function cars()
             mean_age = sum(ages) / length(agents)
             max_age = maximum(ages)
             longest_lineage = maximum([agent.lineage for agent in agents])
-            summary = @sprintf "%8.1ffps age: %5.2f max age: %d longest lineage: %d frame: %d" (1/(tpf/1.0e9)) mean_age max_age longest_lineage frame
+            elapsed = current - started
+            full_fps =1/(elapsed/(frame*1e9))
+            summary = @sprintf "%8.1ffps mean: %7.1ffps age: %5.2f max age: %d longest lineage: %d frame: %d" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
             output = string(chart, "\n", profiling, summary, "\n", hist, "\n")
             lines = countlines(IOBuffer(output))
@@ -1022,6 +1073,11 @@ function main()
     print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
     game = ARGS[1]
+    if length(ARGS) > 1
+        if ARGS[2] == "profile"
+            TimerOutputs.enable_timer!(to)
+        end
+    end
     try
         if game == "cars"
             cars()
