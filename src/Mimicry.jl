@@ -361,7 +361,7 @@ end
 @timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple, grads::NamedTuple)::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
     (probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
     sampled = @timeit to "sample from distribution" sample(probs.means, probs.logvars)
-    loss, dloss = gaussloss_pb(probs.means, probs.logvars, sampled, grads.loss)
+    loss, dloss = @timeit to "compute loss pullback" gaussloss_pb(probs.means, probs.logvars, sampled, grads.loss)
     # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
     @timeit to "run loss pullback" dloss(1.0)
     grads1 = @timeit to "run network pullback" dforward((grads.loss, nothing))[1]
