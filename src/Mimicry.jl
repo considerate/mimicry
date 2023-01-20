@@ -1012,7 +1012,7 @@ function cars()
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, 3e-4, params, arena) for _ in 1:pop_size]
+    agents = [Car(rng, exp(-3.0-rand()*5.0), params, arena) for _ in 1:pop_size]
     history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
     prev = time_ns()
     last_print = 0
@@ -1059,7 +1059,7 @@ function cars()
         if length(history) > 100
             pop!(history)
         end
-        mimic_probability = 0.01
+        mimic_probability = 0.03
         tasks = []
         for k in 1:length(agents)
             if rand() < mimic_probability
