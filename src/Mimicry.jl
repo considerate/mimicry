@@ -41,6 +41,10 @@ end
 struct GaussLoss
     size :: Int64
 end
+struct KLLoss
+    size :: Int64
+    l :: Int64
+end
 
 function Lux.initialparameters(rng::Random.AbstractRNG, network :: Network)
     layers = NamedTupleTools.ntfromstruct(network)
@@ -51,8 +55,6 @@ function Lux.initialstates(rng::Random.AbstractRNG, network :: Network)
     layers = NamedTupleTools.ntfromstruct(network)
     return Lux.initialstates(rng, layers)
 end
-
-#TODO: write initialgradients function
 
 function initialgradients(layer :: Lux.Dense{use_bias}, ps :: NamedTuple) where {use_bias}
     if use_bias
@@ -67,11 +69,19 @@ function initialgradients(network :: Network, ps :: NamedTuple)
     return (dense=initialgradients(network.dense, ps.dense),
             means=means_grads,
             logvars=initialgradients(network.logvars, ps.logvars),
-            y=zero(means_grads.inputs),
+            y=zero(means_grads.inputs)
             )
 end
 function initialgradients(l :: GaussLoss, _ :: NamedTuple)
     return (means=zeros(Float64, l.size), logvars=zeros(Float64, l.size))
+end
+function initialgradients(l :: KLLoss, _ :: NamedTuple)
+    return (means=zeros(Float64, l.l),
+            logvars=zeros(Float64, l.l),
+            target_means=zeros(Float64, l.l),
+            target_logvars=zeros(Float64, l.l),
+            memory=zeros(Float64, l.size)
+           )
 end
 
 # TODO: There's an optimization to be had with aliasing between memories of different layers. For now, we'll over-allocate a bit for the sake of simplicity.
@@ -82,13 +92,25 @@ end
 function initialmemory(network :: Network, ps :: NamedTuple)
     return (dense=initialmemory(network.dense, ps.dense),
             means=initialmemory(network.means, ps.means),
-            logvars=initialmemory(network.logvars, ps.logvars),
+            logvars=initialmemory(network.logvars, ps.logvars)
             )
 end
 
 function initialmemory(l :: GaussLoss, _ :: NamedTuple)
     return (inv_vars=zeros(Float64, l.size), logvars=zeros(Float64, l.size), diffs=zeros(Float64, l.size), losses=zeros(Float64, l.size))
 end
+
+function initialmemory(l :: KLLoss, _ :: NamedTuple)
+    return (losses=zeros(Float64, l.size),
+            diffs=zeros(Float64, l.size),
+            mean_diffs_squared=zeros(Float64, l.size),
+            var_diffs=zeros(Float64, l.size),
+            inv_vars=zeros(Float64, l.size)
+           )
+end
+
+# A -> (B, dB -> dA)
+# (A × X -> B × X, dB × X × G -> dA × G)
 
 
 @inline function (network::Network)(x :: AbstractArray, ps :: NamedTuple, st::NamedTuple)
@@ -179,8 +201,7 @@ mutable struct Car
     age :: Int64
     lineage :: Int64
     feedback_nodes::Vector{Float64} # n_feedback_nodes
-    network::Network
-    loss :: GaussLoss
+    model::@NamedTuple{network::Network, loss::GaussLoss, mimic_loss::KLLoss}
     parameters::NamedTuple
     state::NamedTuple
     body::Body
@@ -261,17 +282,18 @@ function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: Agen
     st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
     feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     loss = GaussLoss(sizes.n3)
+    mimic_loss = KLLoss(1, sizes.n3)
     nop = NamedTuple()
-    grads = (network=initialgradients(network, ps), loss=initialgradients(loss, nop))
-    memory = (network=initialmemory(network, ps), loss=initialmemory(loss, nop))
+    grads = (network=initialgradients(network, ps), loss=initialgradients(loss, nop), mimic_loss=initialgradients(mimic_loss,nop))
+    memory = (network=initialmemory(network, ps), loss=initialmemory(loss, nop), mimic_loss=initialmemory(mimic_loss,nop))
+    model = (network=network,loss=loss,mimic_loss=mimic_loss)
     age = 0
     lineage = 0
     return Car(
         age,
         lineage,
         feedback_nodes,
-        network,
-        loss,
+        model,
         ps,
         st,
         randomBody(arena),
@@ -285,27 +307,85 @@ end
     memory.diffs .= (means.-outputs)
     memory.inv_vars .= exp.(.-logvars)
     memory.logvars .= logvars
-    memory.losses .= memory.logvars
-    memory.losses .+= memory.diffs.^2 .* memory.inv_vars
+    memory.losses .= memory.diffs.^2
+    memory.losses .*= memory.inv_vars
+    memory.losses .+= memory.logvars
     return 0.5*Lux.mean(memory.losses)
 end
+
+# f(a, b) = a * b + b
+# f :: R^n × R^m -> R^k
+# a :: R^n
+# b :: R^m
+# D' f (a, b) (h) = D'(*)(a,b)(h) + D'(snd)(a,b)(h) = (b*h,h*a) + (0, h) = (b*h, h*a + h)
+# h :: R^k
 
 @inline function gaussloss_back(_ :: GaussLoss, dloss :: Float64, grads :: NamedTuple, memory :: NamedTuple)
     grads.means .= (2 * dloss) .* memory.diffs
     grads.logvars .= (memory.diffs.^2 .* memory.inv_vars .* memory.logvars .* (-dloss)) .+ dloss
 end
 
-function divergenceloss(output::Prob, target::Prob) ::Float64
-    (means,logvars) = output
+function divergence_forward(l :: KLLoss, predicted :: Prob, target :: Prob, memory :: NamedTuple) :: Float64
+    # 0.5 (exp(target_logvars - logvars) + ((target_means - means)^2)/exp(logvars) + (target_logvars - logvars) - 1)
+    (means,logvars) = predicted
     (target_means, target_logvars) = target
-    mean_diffs = (means - target_means).^2
-    function kldiv(i)
-        s1 = exp(logvars[i])
-        s2 = exp(target_logvars[i])
-        divergence = target_logvars[i] - logvars[i] + (s1 + mean_diffs[i]) / (2 * s2) - 0.5
-        return divergence
-    end
-    return kldiv(1)
+    memory.diffs .= means[1:l.size]
+    memory.diffs .-= target_means[1:l.size]
+    memory.mean_diffs_squared .= memory.diffs
+    memory.mean_diffs_squared .*= memory.mean_diffs_squared
+    memory.losses .= memory.mean_diffs_squared
+    memory.inv_vars .= .-logvars[1:l.size]
+    memory.inv_vars .= exp.(memory.inv_vars)
+    memory.losses .*= memory.inv_vars
+    memory.var_diffs .= target_logvars[1:l.size]
+    memory.var_diffs .-= logvars[1:l.size]
+    memory.var_diffs .= exp.(memory.var_diffs[1:l.size])
+    memory.losses .+= memory.var_diffs
+    memory.losses .-= 1
+    return 0.5*sum(memory.losses)
+end
+
+# D'(0.5 * (exp(target_logvars - logvars) + ((target_means - means)^2)*exp(-logvars) + (target_logvars - logvars) - 1))(...)(h)
+# D'(0.5 * ...)(...)(h)
+# D'(*)(k,b)(h) = h*k
+# D'(k*_)(x)(h) = D'(_)(x)(k*h)
+# D'(+)(a,b)(h) = (h,h)
+# D'(exp(target_logvars - logvars) + ((target_means - means)^2)/exp(logvars) + (target_logvars - logvars) - 1)(...)(h) =
+#  + D'(exp(target_logvars - logvars))(...)(h)
+#  + D'(((target_means - means)^2)/exp(logvars))(..)(h)
+#  + D'(target_logvars - logvars)(...)(h)
+# D'(target_logvars - logvars)(...)(h) = D'(target_logvars + (-1)*logvars)(...)(h) = (:target_logvars=h, :logvars=-h)
+# D'(exp(target_logvars - logvars))(...)(h) = exp(target_logvars - logvars)*D'(target_logvars - logvars)(...)(h)
+# D'(f ∘ g)(x)(h) = D'(f)(x)(D'(g)(f(x))(h))
+#
+# exp(target_logvars - logvars) + ((target_means - means)^2)/exp(logvars)
+# y = exp(x)
+# D'(exp)(x)(h) = exp(x)*h
+# ∂L/∂x = sum_{i} ∂y_i/∂x * ∂L/∂y_i
+# ∂L/∂x = exp(x) * ∂L/y
+# L(y)
+#
+# D'(exp(target_logvars - logvars))(h)
+#
+# D'(((target_means - means)^2)*exp(-logvars))(..)(h) =
+#    (target_means - means)^2 * D'(exp(-logvars))(...)(h)
+#  + D'((target_means - means)^2)(...)(h) * exp(-logvars)
+# D'(exp(-logvars))(...)(h) = exp(-logvars) * D(-logvars)(...)(h) = exp(-logvars) * (:logvars=-h)
+#
+# D'((target_means - means)^2)(...)(h) * exp(-logvars)
+# = (:target_means=2*(target_means - means)*(1)*h, :means=2*(target_means -means)*(-1)*h) * exp(-logvars)
+
+function divergence_back(l :: KLLoss, dloss :: Float64,  gradients :: NamedTuple, memory :: NamedTuple)
+    dlosses = gradients.memory
+    dlosses .= dloss
+    dlosses .*= 0.5
+    gradients.target_logvars[1:l.size] .= dlosses
+    gradients.logvars[1:l.size] .= .-dlosses
+    gradients.target_logvars[1:l.size] .+= memory.var_diffs .* gradients.memory # exp(target_logvars - logvars) * h
+    gradients.logvars[1:l.size] .-= memory.var_diffs .* gradients.memory # - exp(target_logvars - logvars) * h
+    gradients.logvars[1:l.size] .-= memory.mean_diffs_squared .* memory.inv_vars .* gradients.memory  # - (target_means - means)^2 * exp(-logvars) * h
+    gradients.target_means[1:l.size] .= 2.0 .* memory.diffs .* memory.inv_vars .* gradients.memory
+    gradients.means[1:l.size] .= -2.0 .* memory.diffs .* memory.inv_vars .* gradients.memory
 end
 
 function randompoint(bounds::Bounds) :: Point
@@ -506,8 +586,8 @@ end
     # possible future (micro-)optimisation: this currently updates the network
     # even if the agent hit the edge - that could be avoided
     sensors = sensorValues(agent.body, params, arena)
-    inputs = [sensors; agent.feedback_nodes*1.0]
-    ((loss, means, logvars, outputs), grads, _) = train(agent.network, agent.loss, inputs, agent.parameters, agent.state, agent.gradients, agent.memory)
+    inputs = [sensors; agent.feedback_nodes]
+    ((loss, means, logvars, outputs), grads, _) = train(agent.model.network, agent.model.loss, inputs, agent.parameters, agent.state, agent.gradients, agent.memory)
     @timeit to "optimise" Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
     # @timeit to "zero_grad" zero_grads(agent.gradients)
 
@@ -525,15 +605,15 @@ end
 end
 
 @timeit to "replicate car" function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
-    if Random.rand(rng) < 0.01
-        ps, st = Lux.setup(rng, target.network)
+    if Random.rand(rng) < 0.0
+        ps, st = Lux.setup(rng, target.model.network)
         replicateparams(ps, target.parameters)
         replicateparams(st, target.state)
         target.lineage = 0
         target.feedback_nodes .=  zeros(size(target.feedback_nodes))
         target.body = randomBody(arena)
     else
-        target.network = source.network
+        target.model = source.model
         target.feedback_nodes .= source.feedback_nodes
         replicateparams(source.parameters, target.parameters)
         replicateparams(source.state, target.state)
@@ -886,12 +966,12 @@ end
 
 
 @timeit to "train_mimic" function train_mimic(agent, inputs :: Vector{Float64}, targets :: Prob)
-    (probs, _), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(agent.network, inputs, p, agent.state), agent.parameters)
-    _, dloss = @timeit to "pullback loss" Zygote.pullback(p -> divergenceloss((p.means, p.logvars), targets), probs)
-    dprob = @timeit to "run loss pullback" dloss(1.0)[1]
-    grads = @timeit to "run network pullback" dforward((dprob, nothing))[1]
-    @timeit to "optimise" Optimisers.update(agent.optimiser_state, agent.parameters, grads)
-    return probs
+    (probs, st1) = network_forward(agent.model.network,inputs, agent.parameters, agent.state, agent.memory.network)
+    # agent.state = st1
+    loss = divergence_forward(agent.model.mimic_loss, (probs.means, probs.logvars), targets, agent.memory.mimic_loss)
+    divergence_back(agent.model.mimic_loss, 1.0, agent.gradients.mimic_loss, agent.memory.mimic_loss)
+    network_back(agent.model.network, agent.gradients.mimic_loss, agent.parameters, agent.gradients.network, agent.memory.network)
+    return (loss, probs)
 end
 
 function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Array{Tuple{Prob,Body}})
@@ -906,7 +986,7 @@ function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Ar
     for (_, body) in warmup
         sensors = sensorValues(body, params, arena)
         inputs = [sensors; agent.feedback_nodes*1.0]
-        prob, _ = agent.network(inputs, agent.parameters, agent.state)
+        prob, _ = network_forward(agent.model.network, inputs, agent.parameters, agent.state, agent.memory.network)
         outputs = sample(prob.means, prob.logvars)
         feedback = outputs[2:end]
         agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
@@ -915,7 +995,7 @@ function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Ar
         sensors = sensorValues(body, params, arena)
         inputs = [sensors; agent.feedback_nodes*1.0]
         # train on last step of trajectory
-        probs = train_mimic(agent, inputs, prob)
+        (_,probs) = train_mimic(agent, inputs, prob)
         outputs = sample(probs.means, probs.logvars)
         feedback = outputs[2:end]
         agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
@@ -979,7 +1059,7 @@ function cars()
         if length(history) > 100
             pop!(history)
         end
-        mimic_probability = 0 # 0.01
+        mimic_probability = 0.01
         tasks = []
         for k in 1:length(agents)
             if rand() < mimic_probability
