@@ -15,14 +15,14 @@ import LinearAlgebra
 import ColorSchemes
 
 const tau=2*pi
-const Polygon = Vector{StaticArrays.SVector{2, Float64}}
-const Point = Tuple{Float64, Float64}
-const Polar = Tuple{Float64, Float64}
+const Polygon = Vector{StaticArrays.SVector{2, Float32}}
+const Point = Tuple{Float32, Float32}
+const Polar = Tuple{Float32, Float32}
 const Bounds = Tuple{Point, Point}
 const Arena = Tuple{Polygon, Polygon, Bounds}
 
-const Prob = Tuple{Vector{Float64}, Vector{Float64}}
-const Sampled = Float64
+const Prob = Tuple{Vector{Float32}, Vector{Float32}}
+const Sampled = Float32
 const Parent = Int64
 
 to = TimerOutput()
@@ -34,6 +34,7 @@ end
 
 struct Network <: Lux.AbstractExplicitLayer
     dense :: Lux.Dense
+    dense2 :: Lux.Dense
     means :: Lux.Dense
     logvars :: Lux.Dense
 end
@@ -58,67 +59,62 @@ end
 
 function initialgradients(layer :: Lux.Dense{use_bias}, ps :: NamedTuple) where {use_bias}
     if use_bias
-        return (inputs=zeros(Float64,layer.in_dims), weight=zero(ps.weight), bias=zero(ps.bias))
+        return (inputs=zeros(Float32,layer.in_dims), weight=zero(ps.weight), bias=zero(ps.bias))
     else
-        return (inputs=zeros(Float64,layer.in_dims), weight=zero(ps.weight))
+        return (inputs=zeros(Float32,layer.in_dims), weight=zero(ps.weight))
     end
 end
 
 function initialgradients(network :: Network, ps :: NamedTuple)
     means_grads=initialgradients(network.means, ps.means)
     return (dense=initialgradients(network.dense, ps.dense),
+            dense2=initialgradients(network.dense2, ps.dense2),
             means=means_grads,
             logvars=initialgradients(network.logvars, ps.logvars),
             y=zero(means_grads.inputs)
             )
 end
 function initialgradients(l :: GaussLoss, _ :: NamedTuple)
-    return (means=zeros(Float64, l.size), logvars=zeros(Float64, l.size))
+    return (means=zeros(Float32, l.size), logvars=zeros(Float32, l.size))
 end
 function initialgradients(l :: KLLoss, _ :: NamedTuple)
-    return (means=zeros(Float64, l.l),
-            logvars=zeros(Float64, l.l),
-            target_means=zeros(Float64, l.l),
-            target_logvars=zeros(Float64, l.l),
-            memory=zeros(Float64, l.size)
+    return (means=zeros(Float32, l.l),
+            logvars=zeros(Float32, l.l),
+            target_means=zeros(Float32, l.l),
+            target_logvars=zeros(Float32, l.l),
+            memory=zeros(Float32, l.size)
            )
 end
 
 # TODO: There's an optimization to be had with aliasing between memories of different layers. For now, we'll over-allocate a bit for the sake of simplicity.
-function initialmemory(layer :: Lux.Dense, _ :: NamedTuple)
-    return (x=zeros(Float64,layer.in_dims),y=zeros(Float64,layer.out_dims))
+function initialmemory(layer :: Lux.Dense, ps :: NamedTuple)
+    return (x=zeros(Float32,layer.in_dims),y=zeros(Float32,layer.out_dims),w=zero(transpose(ps.weight)))
 end
 
 function initialmemory(network :: Network, ps :: NamedTuple)
     return (dense=initialmemory(network.dense, ps.dense),
+            dense2=initialmemory(network.dense2, ps.dense2),
             means=initialmemory(network.means, ps.means),
             logvars=initialmemory(network.logvars, ps.logvars)
             )
 end
 
 function initialmemory(l :: GaussLoss, _ :: NamedTuple)
-    return (inv_vars=zeros(Float64, l.size), logvars=zeros(Float64, l.size), diffs=zeros(Float64, l.size), losses=zeros(Float64, l.size))
+    return (inv_vars=zeros(Float32, l.size), logvars=zeros(Float32, l.size), diffs=zeros(Float32, l.size), losses=zeros(Float32, l.size))
 end
 
 function initialmemory(l :: KLLoss, _ :: NamedTuple)
-    return (losses=zeros(Float64, l.size),
-            diffs=zeros(Float64, l.size),
-            mean_diffs_squared=zeros(Float64, l.size),
-            var_diffs=zeros(Float64, l.size),
-            inv_vars=zeros(Float64, l.size)
+    return (losses=zeros(Float32, l.size),
+            diffs=zeros(Float32, l.size),
+            mean_diffs_squared=zeros(Float32, l.size),
+            var_diffs=zeros(Float32, l.size),
+            inv_vars=zeros(Float32, l.size)
            )
 end
 
 # A -> (B, dB -> dA)
 # (A × X -> B × X, dB × X × G -> dA × G)
 
-
-@inline function (network::Network)(x :: AbstractArray, ps :: NamedTuple, st::NamedTuple)
-    y, st_dense = network.dense(x, ps.dense, st.dense)
-    mu, st_mean = network.means(y, ps.means, st.means)
-    sigma, st_logvar = network.logvars(y, ps.logvars, st.logvars)
-    return (means=mu, logvars=sigma), (dense=st_dense, mean=st_mean, logvar=st_logvar)
-end
 
 function logvar_activation(x)
     min_std_deviation = 0.01
@@ -153,22 +149,24 @@ end
     memory.x .= x
     LinearAlgebra.mul!(memory.y, ps.weight, x)
     memory.y .+= ps.bias
+    memory.w .= transpose(ps.weight)
     return memory.y, nothing
 end
 
-@inline function dense_back(layer :: Lux.Dense, dy :: AbstractArray, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
+@inline function dense_back(layer :: Lux.Dense, dy :: AbstractArray, _ :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
     dy = activation_grad(layer.activation, memory.y, dy)
     grads.weight .= dy .* memory.x'
-    # LinearAlgebra.kron!(grads.weight, dy, memory.x)
+    # LinearAlgebra.kron!(grads.weight, memory.x, dy)
     grads.bias .= dy
-    LinearAlgebra.mul!(grads.inputs, transpose(ps.weight), dy)
+    LinearAlgebra.mul!(grads.inputs, memory.w, dy)
 end
 
 @inline function network_forward(network :: Network, x :: AbstractArray, ps :: NamedTuple, st :: NamedTuple, memory :: NamedTuple)
-    (y, st_dense) = dense_forward(network.dense, x, ps.dense, st.dense, memory.dense)
+    (z, st_dense) = dense_forward(network.dense, x, ps.dense, st.dense, memory.dense)
+    (y, st_dense2) = dense_forward(network.dense2, z, ps.dense2, st.dense2, memory.dense2)
     (mu, st_mean) = dense_forward(network.means, y, ps.means, st.means, memory.means)
     (sigma, st_logvar) = dense_forward(network.logvars, y, ps.logvars, st.logvars, memory.logvars)
-    return (means=mu, logvars=sigma), (dense=st_dense, means=st_mean, logvars=st_logvar)
+    return (means=mu, logvars=sigma), (dense=st_dense, dense2=st_dense2, means=st_mean, logvars=st_logvar)
 end
 
 @inline function network_back(network :: Network, dout :: NamedTuple, ps :: NamedTuple, grads :: NamedTuple, memory :: NamedTuple)
@@ -176,7 +174,8 @@ end
     dense_back(network.means, dout.means, ps.means, grads.logvars, memory.means)
     grads.y .= grads.logvars.inputs
     grads.y .+= grads.means.inputs
-    dense_back(network.dense, grads.y, ps.dense, grads.dense, memory.dense)
+    dense_back(network.dense2, grads.y, ps.dense2, grads.dense2, memory.dense2)
+    dense_back(network.dense, grads.dense2.inputs, ps.dense, grads.dense, memory.dense)
 end
 
 struct Sizes
@@ -190,9 +189,9 @@ end
 const AgentParams = Tuple{Vector{Polar}, Sizes}
 
 struct Body
-    x::Float64
-    y::Float64
-    theta::Float64
+    x::Float32
+    y::Float32
+    theta::Float32
 end
 
 # A Car decides:
@@ -200,7 +199,7 @@ end
 mutable struct Car
     age :: Int64
     lineage :: Int64
-    feedback_nodes::Vector{Float64} # n_feedback_nodes
+    feedback_nodes::Vector{Float32} # n_feedback_nodes
     model::@NamedTuple{network::Network, loss::GaussLoss, mimic_loss::KLLoss}
     parameters::NamedTuple
     state::NamedTuple
@@ -216,12 +215,12 @@ end
 # - whether to attack or not (sigmoid)
 mutable struct Predator
     animal :: Int64 # TODO: replace with a proper type
-    feedback_nodes::Vector{Float64}
+    feedback_nodes::Vector{Float32}
     network::Network
     parameters::NamedTuple
     state::NamedTuple
     energy::Int64 # negative energy implies death
-    age :: Float64
+    age :: Float32
     attacking::Int64
     health :: Int64
     body::Body
@@ -234,12 +233,12 @@ end
 # - whether to attack/eat food or not (sigmoid)
 mutable struct Prey
     animal :: Int64
-    feedback_nodes::Vector{Float64}
+    feedback_nodes::Vector{Float32}
     network::Network
     parameters::NamedTuple
     state::NamedTuple
     energy::Int64
-    age :: Float64
+    age :: Float32
     attacking::Int64
     health :: Int64
     body::Body
@@ -255,6 +254,7 @@ end
 
 function randomnetwork(rng, s)
     network = Network(Lux.Dense(s.n1, s.n2, Lux.relu),
+                      Lux.Dense(s.n2, s.n2, Lux.relu),
                       Lux.Dense(s.n2, s.n3),
                       Lux.Dense(s.n2, s.n3, logvar_activation),
                      )
@@ -276,7 +276,7 @@ function zero_grads(grads :: NamedTuple)
     walk_nested(x -> x .= 0, grads)
 end
 
-function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: AgentParams, arena :: Arena)
+function Car(rng :: Random.AbstractRNG, learning_rate :: Float32, params :: AgentParams, arena :: Arena)
     (_, sizes) = params
     network, ps, st = randomnetwork(rng, sizes)
     st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
@@ -303,7 +303,7 @@ function Car(rng :: Random.AbstractRNG, learning_rate :: Float64, params :: Agen
     )
 end
 
-@inline function gaussloss_forward(_ :: GaussLoss, means :: Vector{Float64}, logvars :: Vector{Float64}, outputs::Vector{Float64}, memory :: NamedTuple)
+@inline function gaussloss_forward(_ :: GaussLoss, means :: Vector{Float32}, logvars :: Vector{Float32}, outputs::Vector{Float32}, memory :: NamedTuple)
     memory.diffs .= (means.-outputs)
     memory.inv_vars .= exp.(.-logvars)
     memory.logvars .= logvars
@@ -320,12 +320,12 @@ end
 # D' f (a, b) (h) = D'(*)(a,b)(h) + D'(snd)(a,b)(h) = (b*h,h*a) + (0, h) = (b*h, h*a + h)
 # h :: R^k
 
-@inline function gaussloss_back(_ :: GaussLoss, dloss :: Float64, grads :: NamedTuple, memory :: NamedTuple)
+@inline function gaussloss_back(_ :: GaussLoss, dloss :: Float32, grads :: NamedTuple, memory :: NamedTuple)
     grads.means .= (2 * dloss) .* memory.diffs
     grads.logvars .= (memory.diffs.^2 .* memory.inv_vars .* memory.logvars .* (-dloss)) .+ dloss
 end
 
-function divergence_forward(l :: KLLoss, predicted :: Prob, target :: Prob, memory :: NamedTuple) :: Float64
+function divergence_forward(l :: KLLoss, predicted :: Prob, target :: Prob, memory :: NamedTuple) :: Float32
     # 0.5 (exp(target_logvars - logvars) + ((target_means - means)^2)/exp(logvars) + (target_logvars - logvars) - 1)
     (means,logvars) = predicted
     (target_means, target_logvars) = target
@@ -375,7 +375,7 @@ end
 # D'((target_means - means)^2)(...)(h) * exp(-logvars)
 # = (:target_means=2*(target_means - means)*(1)*h, :means=2*(target_means -means)*(-1)*h) * exp(-logvars)
 
-function divergence_back(l :: KLLoss, dloss :: Float64,  gradients :: NamedTuple, memory :: NamedTuple)
+function divergence_back(l :: KLLoss, dloss :: Float32,  gradients :: NamedTuple, memory :: NamedTuple)
     dlosses = gradients.memory
     dlosses .= dloss
     dlosses .*= 0.5
@@ -422,8 +422,8 @@ function moveForward(rng :: Random.AbstractRNG, b::Body)
     speed = 0.05;
 
     return Body(
-        b.x + speed*sin(b.theta), # + Random.randn(rng) * 0.001,
-        b.y + speed*cos(b.theta), # + Random.randn(rng) * 0.001,
+        b.x + speed*sin(b.theta) + Random.randn(rng) * 0.001,
+        b.y + speed*cos(b.theta) + Random.randn(rng) * 0.001,
         b.theta,
     )
 end
@@ -542,23 +542,23 @@ function ontrack(p, arena :: Arena)
     return PolygonOps.inpolygon(p, outer) == 1 && PolygonOps.inpolygon(p, inner) == 0
 end
 
-function sample(means::Vector{Float64},logvars::Vector{Float64})::Vector{Float64}
+function sample(means::Vector{Float32},logvars::Vector{Float32})::Vector{Float32}
     sigma = exp.(logvars*0.5)
-    return randn(length(means)).*sigma + means
+    return Float32.(randn(length(means))).*sigma + means
 end
 
-@timeit to "train" function train(net::Network, l :: GaussLoss, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple,  grads::NamedTuple, memory :: NamedTuple)::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+@timeit to "train" function train(net::Network, l :: GaussLoss, inputs::Vector{Float32}, ps :: NamedTuple, st :: NamedTuple,  grads::NamedTuple, memory :: NamedTuple)::Tuple{Tuple{Float32, Vector{Float32},Vector{Float32}, Vector{Float32}}, Any, Any}
     (probs, st1) = network_forward(net,inputs,ps,st, memory.network)
     #(probs, st1), dforward = @timeit to "pullback network" Zygote.pullback(p -> Lux.apply(net, inputs, p, st), ps)
     sampled = sample(probs.means, probs.logvars)
     loss = gaussloss_forward(l, probs.means, probs.logvars, sampled, memory.loss)
     # loss, dloss = @timeit to "pullback loss" Zygote.pullback(p -> gaussloss(p.means, p.logvars, sampled), probs)
-    gaussloss_back(l, 1.0, grads.loss, memory.loss)
+    gaussloss_back(l, Float32(1.0), grads.loss, memory.loss)
     network_back(net, grads.loss, ps, grads.network, memory.network)
     return ((loss, probs.means, probs.logvars, sampled), grads.network, st1)
 end
 
-# @timeit to "train" function train(net::Network, inputs::Vector{Float64}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float64, Vector{Float64},Vector{Float64}, Vector{Float64}}, Any, Any}
+# @timeit to "train" function train(net::Network, inputs::Vector{Float32}, ps :: NamedTuple, st :: NamedTuple )::Tuple{Tuple{Float32, Vector{Float32},Vector{Float32}, Vector{Float32}}, Any, Any}
 #     function model(p)
 #         (probs, st1) = Lux.apply(net, inputs, p, st)
 #         sampled = Zygote.dropgrad(sample(probs.means, probs.logvars))
@@ -605,13 +605,14 @@ end
 end
 
 @timeit to "replicate car" function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
-    if Random.rand(rng) < 0.0
+    if Random.rand(rng) < 0.01
         ps, st = Lux.setup(rng, target.model.network)
         replicateparams(ps, target.parameters)
         replicateparams(st, target.state)
         target.lineage = 0
         target.feedback_nodes .=  zeros(size(target.feedback_nodes))
         target.body = randomBody(arena)
+        return true
     else
         target.model = source.model
         target.feedback_nodes .= source.feedback_nodes
@@ -620,6 +621,7 @@ end
         replicateparams(source.optimiser_state, target.optimiser_state)
         target.lineage = source.lineage
         target.body = source.body
+        return false
     end
 
 end
@@ -638,7 +640,7 @@ function sensorPoints(b::Body, sensorParams :: Vector{Polar}) :: Vector{Point}
     return [pointFromParams(length,angle) for (length,angle) in sensorParams]
 end
 
-function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float64}
+function sensorValues(b::Body, params :: AgentParams, arena :: Arena) :: Vector{Float32}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
     return [!ontrack(p, arena) for p in points]
@@ -786,7 +788,7 @@ function outside(p, bounds)
     return false
 end
 
-function animalsensors(b::Body, params :: AgentParams, bounds :: Bounds, predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}) :: Vector{Float64}
+function animalsensors(b::Body, params :: AgentParams, bounds :: Bounds, predators :: Vector{Predator}, prey :: Vector{Prey}, food :: Vector{Food}) :: Vector{Float32}
     (sensorParams, _) = params
     points = sensorPoints(b, sensorParams)
     function dist(agent,p)
@@ -885,7 +887,7 @@ function animals()
     params = agentparams(3)
     (n_predators, n_prey, n_food) = (50, 100, 50)
     rng = Random.default_rng()
-    Random.seed!(rng, 0)
+    Random.seed!(rng, 123458)
     predators = [Predator(rng, 1e-4, params, bounds) for _ in 1:n_predators]
     prey = [Prey(rng, 1e-4, params, bounds) for _ in 1:n_prey]
     food = [Food(bounds) for _ in 1:n_food]
@@ -965,11 +967,10 @@ end
 
 
 
-@timeit to "train_mimic" function train_mimic(agent, inputs :: Vector{Float64}, targets :: Prob)
+@timeit to "train_mimic" function train_mimic(agent, inputs :: Vector{Float32}, targets :: Prob)
     (probs, st1) = network_forward(agent.model.network,inputs, agent.parameters, agent.state, agent.memory.network)
-    # agent.state = st1
     loss = divergence_forward(agent.model.mimic_loss, (probs.means, probs.logvars), targets, agent.memory.mimic_loss)
-    divergence_back(agent.model.mimic_loss, 1.0, agent.gradients.mimic_loss, agent.memory.mimic_loss)
+    divergence_back(agent.model.mimic_loss, Float32(1.0), agent.gradients.mimic_loss, agent.memory.mimic_loss)
     network_back(agent.model.network, agent.gradients.mimic_loss, agent.parameters, agent.gradients.network, agent.memory.network)
     return (loss, probs)
 end
@@ -993,7 +994,7 @@ function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Ar
     end
     for (prob, body) in training
         sensors = sensorValues(body, params, arena)
-        inputs = [sensors; agent.feedback_nodes*1.0]
+        inputs :: Vector{Float32} = [sensors; agent.feedback_nodes*1.0]
         # train on last step of trajectory
         (_,probs) = train_mimic(agent, inputs, prob)
         outputs = sample(probs.means, probs.logvars)
@@ -1012,7 +1013,7 @@ function cars()
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, exp(-3.0-rand()*5.0), params, arena) for _ in 1:pop_size]
+    agents = [Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), params, arena) for _ in 1:pop_size]
     history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
     prev = time_ns()
     last_print = 0
@@ -1022,6 +1023,7 @@ function cars()
     frame = 0
     realtime = false
     target_fps = 30
+    expectancy = 0.0
     while true
         Threads.@threads for k in 1:length(agents)
             agent = agents[k]
@@ -1033,6 +1035,14 @@ function cars()
 
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
 
+        if !any(alive)
+            for i in 1:length(agents)
+                car = Car(rng, Float32(exp(-2.0-Random.rand(rng, Float32)*5.0)), params, arena)
+                replicatecar(rng, car, agents[i], arena)
+                alive[i] = true
+            end
+        end
+
 
         Threads.@threads for i in 1:length(agents)
             if !alive[i]
@@ -1043,9 +1053,18 @@ function cars()
                     neighbour = mod1(k+rand([-1,1]), length(agents))
                 end
                 @assert alive[neighbour]
+                if expectancy == 0.0
+                    expectancy = agents[i].age
+                else
+                    expectancy = 0.9 * expectancy + 0.1 * agents[i].age
+                end
                 agents[i].age = 0
-                parents[i] = neighbour
-                replicatecar(rng, agents[neighbour], agents[i], arena)
+                new = replicatecar(rng, agents[neighbour], agents[i], arena)
+                if !new
+                    parents[i] = neighbour
+                else
+                    parents[i] = 0
+                end
             end
         end
         function agent_step(k)
@@ -1056,27 +1075,33 @@ function cars()
         end
         @timeit to "step history" step :: Vector{Tuple{Prob, Sampled, Body, Parent}} = [agent_step(k) for k in 1:length(agents) ]
         pushfirst!(history, step)
-        if length(history) > 100
+        if length(history) > 200
             pop!(history)
         end
-        mimic_probability = 0.03
+        mimic_probability = 0.01
+        discard_end = 30
         tasks = []
         for k in 1:length(agents)
-            if rand() < mimic_probability
+            if length(history) > discard_end && Random.rand(rng) < mimic_probability
                 t = Threads.@spawn begin
                     agent = agents[k]
                     trajectory :: Array{Tuple{Prob, Body}} = []
-                    index = argmax([agent.age for agent in agents])
-                    #index = rand(1:pop_size)
+                    # index = argmax([agent.age for agent in agents])
+                    index = rand(1:pop_size)
                     while index == k
                         index = rand(1:pop_size)
                     end
                     for t in 1:length(history)
                         prob, _, body, parent = history[t][index]
+                        if parent == 0
+                            return
+                        end
                         pushfirst!(trajectory, (prob, body))
                         index = parent
                     end
-                    mimic(agent, params, arena, trajectory)
+                    if length(trajectory) > discard_end
+                        mimic(agent, params, arena, trajectory[1:end-discard_end])
+                    end
                 end
                 push!(tasks, t)
             end
@@ -1104,13 +1129,13 @@ function cars()
             elapsed = current - started
             full_fps =1/(elapsed/(frame*1e9))
             is_realtime = realtime ? "true" : "false"
-            summary = @sprintf "%8.1ffps mean: %7.1ffps age: %5.2f max age: %d longest lineage: %d frame: %d realtime %s" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime
+            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
             output = string(chart, "\n", profiling, summary, "\n", hist, "\n")
             lines = countlines(IOBuffer(output))
-            print("\033[J") # clear to end of screen
             print(output)
             print("\033[s") # save cursor
+            print("\033[J") # clear to end of screen
             print(string("\033[",lines,"A"))
             last_print = current
         end
@@ -1141,7 +1166,7 @@ function grads()
     Random.seed!(rng, 0)
     car = Car(rng, 1e-4, params, arena)
     sensors = sensorValues(car.body, params, arena)
-    inputs = [sensors; car.feedback_nodes*1.0]
+    inputs = [sensors; car.feedback_nodes]
     code = Base.code_typed() do
         Zygote._pullback(Zygote.Context(), p -> Lux.apply(car.network, inputs, p, car.state), car.parameters)
     end
