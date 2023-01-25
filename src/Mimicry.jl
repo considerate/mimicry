@@ -182,6 +182,7 @@ struct Sizes
     n1 :: Int64
     n2 :: Int64
     n3 :: Int64
+    n_outputs :: Int64
     n_sensors :: Int64
     n_feedback_nodes :: Int64
 end
@@ -200,10 +201,10 @@ mutable struct Car
     age :: Int64
     lineage :: Int64
     feedback_nodes::Vector{Float32} # n_feedback_nodes
+    body::Body
     model::@NamedTuple{network::Network, loss::GaussLoss, mimic_loss::KLLoss}
     parameters::NamedTuple
     state::NamedTuple
-    body::Body
     optimiser_state :: NamedTuple
     gradients :: NamedTuple
     memory :: NamedTuple
@@ -216,15 +217,17 @@ end
 mutable struct Predator
     animal :: Int64 # TODO: replace with a proper type
     feedback_nodes::Vector{Float32}
-    network::Network
-    parameters::NamedTuple
-    state::NamedTuple
     energy::Int64 # negative energy implies death
     age :: Float32
     attacking::Int64
     health :: Int64
     body::Body
+    model::@NamedTuple{network::Network, loss::GaussLoss, mimic_loss::KLLoss}
+    parameters::NamedTuple
+    state::NamedTuple
     optimiser_state :: NamedTuple
+    gradients :: NamedTuple
+    memory :: NamedTuple
 end
 
 # A Predator decides:
@@ -234,15 +237,17 @@ end
 mutable struct Prey
     animal :: Int64
     feedback_nodes::Vector{Float32}
-    network::Network
-    parameters::NamedTuple
-    state::NamedTuple
     energy::Int64
     age :: Float32
     attacking::Int64
     health :: Int64
     body::Body
+    model::@NamedTuple{network::Network, loss::GaussLoss, mimic_loss::KLLoss}
+    parameters::NamedTuple
+    state::NamedTuple
     optimiser_state :: NamedTuple
+    gradients :: NamedTuple
+    memory :: NamedTuple
 end
 
 mutable struct Food
@@ -276,27 +281,32 @@ function zero_grads(grads :: NamedTuple)
     walk_nested(x -> x .= 0, grads)
 end
 
-function Car(rng :: Random.AbstractRNG, learning_rate :: Float32, params :: AgentParams, arena :: Arena)
-    (_, sizes) = params
+function initialmodel(rng, sizes)
     network, ps, st = randomnetwork(rng, sizes)
-    st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
-    feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     loss = GaussLoss(sizes.n3)
-    mimic_loss = KLLoss(1, sizes.n3)
+    mimic_loss = KLLoss(sizes.n_outputs, sizes.n3)
     nop = NamedTuple()
     grads = (network=initialgradients(network, ps), loss=initialgradients(loss, nop), mimic_loss=initialgradients(mimic_loss,nop))
     memory = (network=initialmemory(network, ps), loss=initialmemory(loss, nop), mimic_loss=initialmemory(mimic_loss,nop))
     model = (network=network,loss=loss,mimic_loss=mimic_loss)
+    return (model, ps, st, grads, memory)
+end
+
+function Car(rng :: Random.AbstractRNG, learning_rate :: Float32, params :: AgentParams, arena :: Arena)
+    (_, sizes) = params
+    feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     age = 0
     lineage = 0
+    (model, ps, st, grads, memory) = initialmodel(rng, sizes)
+    st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
     return Car(
         age,
         lineage,
         feedback_nodes,
+        randomBody(arena),
         model,
         ps,
         st,
-        randomBody(arena),
         st_opt,
         grads,
         memory,
@@ -422,8 +432,8 @@ function moveForward(rng :: Random.AbstractRNG, b::Body)
     speed = 0.05;
 
     return Body(
-        b.x + speed*sin(b.theta) + Random.randn(rng) * 0.001,
-        b.y + speed*cos(b.theta) + Random.randn(rng) * 0.001,
+        b.x + speed*sin(b.theta), # + Random.randn(rng) * 0.001,
+        b.y + speed*cos(b.theta), # + Random.randn(rng) * 0.001,
         b.theta,
     )
 end
@@ -658,34 +668,37 @@ function agentparams(n_outputs) :: AgentParams
     n1 = n_sensors + n_feedback_nodes;
     n2 = n_hidden_nodes;
     n3 = n_outputs + n_feedback_nodes;
-    sizes = Sizes(n1, n2, n3, n_sensors, n_feedback_nodes)
+    sizes = Sizes(n1, n2, n3, n_outputs, n_sensors, n_feedback_nodes)
     return (sensorParams, sizes)
 end
 
 function PredatorPrey(rng, learning_rate, params, bounds, animal, f)
     (_, sizes) = params
-    network, ps, st = randomnetwork(rng, sizes)
-    st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
+    (model, ps, st, grads, memory) = initialmodel(rng, sizes)
+    st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
+    # st_opt = Optimisers.setup(Optimisers.ADAM(learning_rate), ps)
     feedback_nodes = Random.randn(sizes.n_feedback_nodes) * (1.0/sizes.n_feedback_nodes)
     (x,y) = randompoint(bounds)
     theta = rand()*tau
     body = Body(x,y,theta)
-    energy = rand(400:500)
+    energy = rand(4000:5000)
     health = 100
     attacking = 0
     age = 0
     return f(
         animal,
         feedback_nodes,
-        network,
-        ps,
-        st,
         energy,
         age,
         attacking,
         health,
         body,
+        model,
+        ps,
+        st,
         st_opt,
+        grads,
+        memory,
     )
 end
 
@@ -698,7 +711,7 @@ function Prey(rng, learning_rate, params, bounds) :: Prey
 end
 
 function Food(bounds) :: Food
-    energy = rand(60:120)
+    energy = rand(400:600)
     health = 40
     (x,y) = randompoint(bounds)
     theta = rand()*tau
@@ -738,7 +751,7 @@ end
 
 function replicatepredatorprey(rng, source, target, bounds :: Bounds)
     if Random.rand(rng) < 0.01
-        ps, st = Lux.setup(rng, target.network)
+        ps, st = Lux.setup(rng, target.model.network)
         target.parameters = ps
         target.state = st
         target.feedback_nodes[:] .=  zeros(size(target.feedback_nodes))
@@ -746,7 +759,7 @@ function replicatepredatorprey(rng, source, target, bounds :: Bounds)
         theta = rand()*tau
         target.body = Body(x,y,theta)
     else
-        target.network = source.network
+        target.model = source.model
         target.feedback_nodes[:] .= source.feedback_nodes
         replicateparams(source.parameters, target.parameters)
         replicateparams(source.state, target.state)
@@ -822,10 +835,21 @@ function clampbounds(body, bounds)
     return Body(x,y,body.theta)
 end
 
+function inbounds(body, bounds)
+    ((xmin, xmax), (ymin, ymax)) = bounds
+    if body.x < xmin || body.x > xmax
+        return false
+    end
+    if body.y < ymin || body.y > ymax
+        return false
+    end
+    return true
+end
+
 function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators, prey, food)
     sensors = animalsensors(agent.body, params, bounds, predators, prey, food)
-    inputs = [sensors; agent.feedback_nodes*1.0]
-    (loss, _, _, outputs), grads, _ = train(agent.network, inputs, agent.parameters, agent.state)
+    inputs = [sensors; agent.feedback_nodes]
+    ((loss, means, logvars, outputs), grads, _) = train(agent.model.network, agent.model.loss, inputs, agent.parameters, agent.state, agent.gradients, agent.memory)
     Optimisers.update(agent.optimiser_state, agent.parameters, grads)
 
     vfwd = tanh(outputs[1])
@@ -841,26 +865,35 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
     x = body.x + cos(body.theta) * vfwd * speed
     y = body.y + sin(body.theta) * vside * speed
     theta = atan(vside, vfwd)
-    agent.body = clampbounds(Body(x, y, theta), bounds)
+    newbody = Body(x, y, theta)
+    (predate, defend, eat, destroy) = (0,0,0,0)
+    if inbounds(newbody, bounds)
+        agent.body = newbody
+    else
+        agent.health = -1 # kill the agent
+        return ((means, logvars), 0, (predate, defend, eat, destroy))
+    end
     fwd = Body(body.x + cos(body.theta) * attackradius,
                body.y + sin(body.theta) * attackradius,
                theta,
               )
     agent.energy -= 2
-    if attack >= 0.5
-        agent.energy -= 2
+    if rand() < attack
+        agent.energy -= 10
         if agent.animal == 1
             for p in prey
                 if sqdist(p.body, body) < radiussq && inview(body, p.body, fwd, attackfield)
                     p.health -= 40
                     if p.health <= 0
-                        agent.energy += 200
+                        agent.energy += p.energy ÷ 2
+                        predate += 1
                     end
                 end
             end
             for f in food
                 if sqdist(f.body, body) < radiussq && inview(body, f.body, fwd, attackfield)
                     f.health -= 20
+                    destroy += 1
                 end
             end
         elseif agent.animal == 2
@@ -869,40 +902,84 @@ function updateanimal(agent, params :: AgentParams, bounds :: Bounds, predators,
                     f.health -= 40
                     if f.health <= 0
                         agent.energy += f.energy
+                        eat += 1
                     end
                 end
             end
             for p in predators
                 if sqdist(p.body, body) < radiussq && inview(body, p.body, fwd, attackfield)
-                    p.health -= 10
+                    p.health -= 5
+                    if p.health <= 0
+                        defend += 1
+                    end
                 end
             end
         end
     end
-    return (outputs, loss)
+    return ((means, logvars), loss, (predate, defend, eat, destroy))
 end
 
 function animals()
+    Base.start_reading(stdin)
     bounds :: Bounds = ((0, 10), (0, 10))
     params = agentparams(3)
     (n_predators, n_prey, n_food) = (50, 100, 50)
     rng = Random.default_rng()
     Random.seed!(rng, 123458)
-    predators = [Predator(rng, 1e-4, params, bounds) for _ in 1:n_predators]
-    prey = [Prey(rng, 1e-4, params, bounds) for _ in 1:n_prey]
+    predators = [Predator(rng, Float32(exp(-2.0-Random.rand(rng, Float32)*5.0)), params, bounds) for _ in 1:n_predators]
+    prey = [Prey(rng, Float32(exp(-2.0-Random.rand(rng, Float32)*5.0)), params, bounds) for _ in 1:n_prey]
     food = [Food(bounds) for _ in 1:n_food]
     last_print = 0
-    history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
+    predate_count = 0
+    defend_count = 0
+    eat_count = 0
+    destroy_count = 0
+    predator_starve = 0
+    prey_starve = 0
+    realtime = false
+    target_fps = 40
+    tpf = 0.001
+    prev = time_ns()
+    predator_parents = [i for i in 1:length(predators)]
+    prey_parents = [i for i in 1:length(prey)]
+    predator_results = Vector{Prob}(undef,(length(predators),))
+    prey_results = Vector{Prob}(undef,(length(prey),))
+    predator_history :: Vector{Vector{Tuple{Prob,Body,Parent}}} = []
+    prey_history :: Vector{Vector{Tuple{Prob,Body,Parent}}} = []
     while true
+        updates = [(0,0,0,0) for _ in 1:length(predators)]
         Threads.@threads for k in 1:length(predators)
             predator = predators[k]
-            updateanimal(predator, params, bounds, predators, prey, food)
+            ((means, logvars), _, update) = updateanimal(predator, params, bounds, predators, prey, food)
+            updates[k] = update
+            predator_results[k] = (means, logvars)
+        end
+        for (predate, defend, eat, destroy) in updates
+            predate_count += predate
+            defend_count += defend
+            eat_count += eat
+            defend_count += destroy
         end
         alive = [p.energy > 0 && p.health > 0 for p in predators]
-        Threads.@threads for i in 1:length(predators)
+        for predator in predators
+            if predator.energy <= 0
+                predator_starve += 1
+            end
+        end
+        if !any(alive)
+            for (k, predator) in enumerate(predators)
+                (x,y) = randompoint(bounds)
+                theta = rand()*tau
+                predator.body = Body(x,y,theta)
+                predator.energy = rand(300:400)
+                alive[k] = true
+            end
+        end
+        for i in 1:length(predators)
             predator = predators[i]
             if alive[i]
                 predator.age += 1
+                predator_parents[i] = i
             else
                 k = i
                 neighbour = mod1(k+rand([-1,1]),n_predators)
@@ -913,39 +990,55 @@ function animals()
                     neighbour = mod1(k+rand([-1,1]),n_predators)
                     target = predators[neighbour]
                     retries += 1
-                    if retries > 20
-                        target = Predator(rng, 1e-4, params, bounds)
-                        break
-                    end
                 end
-                @assert alive[neighbour] || retries > 20
+                @assert alive[neighbour]
+                predator_parents[i] = neighbour
                 replicatepredatorprey(rng, target, predator, bounds)
             end
         end
+        updates = [(0,0,0,0) for _ in 1:length(prey)]
         Threads.@threads for k in 1:length(prey)
             p = prey[k]
-            updateanimal(p, params, bounds, predators, prey, food)
+            ((means, logvars),_,update) = updateanimal(p, params, bounds, predators, prey, food)
+            updates[k] = update
+            prey_results[k] = (means, logvars)
+        end
+        for (predate, defend, eat, destroy) in updates
+            predate_count += predate
+            defend_count += defend
+            eat_count += eat
+            defend_count += destroy
         end
         alive = [p.energy > 0 && p.health > 0 for p in prey]
-        Threads.@threads for i in 1:length(prey)
+        for p in prey
+            if p.energy <= 0
+                prey_starve += 1
+            end
+        end
+        if !any(alive)
+            for (k,p) in enumerate(prey)
+                (x,y) = randompoint(bounds)
+                theta = rand()*tau
+                p.body = Body(x,y,theta)
+                p.energy = rand(300:400)
+                alive[k] = true
+            end
+        end
+        for i in 1:length(prey)
             if alive[i]
                 prey[i].age += 1
+                prey_parents[i] = i
             else
                 k = 1
                 neighbour = mod1(k+Random.rand(rng, [-1,1]), n_prey)
                 target = prey[neighbour]
-                retries = 0
                 while !alive[neighbour]
                     k = neighbour
                     neighbour = mod1(k+rand([-1,1]), n_prey)
                     target = prey[neighbour]
-                    retries += 1
-                    if retries > 20
-                        target = Prey(rng, 1e-4, params, bounds)
-                        break
-                    end
                 end
-                @assert alive[neighbour] || retries > 20
+                @assert alive[neighbour]
+                prey_parents[i] = neighbour
                 replicatepredatorprey(rng, target, prey[i], bounds)
             end
         end
@@ -954,14 +1047,83 @@ function animals()
                 food[k] = Food(bounds)
             end
         end
+        function agent_step(body, results, parents, k)
+            prob = results[k]
+            parent = parents[k]
+            return (prob, body, parent)
+        end
+        predator_step :: Vector{Tuple{Prob, Body, Parent}} = [agent_step(predators[k].body, predator_results, predator_parents, k) for k in 1:length(predators) ]
+        pushfirst!(predator_history, predator_step)
+        if length(predator_history) > 200
+            pop!(predator_history)
+        end
+        prey_step :: Vector{Tuple{Prob, Body, Parent}} = [agent_step(prey[k].body, prey_results, prey_parents, k) for k in 1:length(prey) ]
+        pushfirst!(prey_history, prey_step)
+        if length(prey_history) > 200
+            pop!(prey_history)
+        end
+        mimic_probability = 0.01
+        discard_end = 30
+        tasks = []
+        for (agents, history) in [(predators, predator_history), (prey, prey_history)]
+            for k in 1:length(agents)
+                if length(history) > discard_end && Random.rand(rng) < mimic_probability
+                    t = Threads.@spawn begin
+                        agent = agents[k]
+                        trajectory :: Array{Tuple{Prob, Body}} = []
+                        # index = argmax([agent.age for agent in agents])
+                        index = rand(1:pop_size)
+                        while index == k
+                            index = rand(1:pop_size)
+                        end
+                        for t in 1:length(history)
+                            prob, body, parent = history[t][index]
+                            if parent == 0
+                                return
+                            end
+                            pushfirst!(trajectory, (prob, body))
+                            index = parent
+                        end
+                        if length(trajectory) > discard_end
+                            mimic(agent, params, arena, trajectory[1:end-discard_end])
+                        end
+                    end
+                    push!(tasks, t)
+                end
+            end
+        end
         current = time_ns()
+        bb = bytesavailable(stdin)
+        if bb > 0
+            data = read(stdin, bb)
+            if data[1] == UInt(32)
+                realtime = !realtime
+            end
+        end
         if current - last_print > 0.05e9
-            (plt, (_, height)) = draw_animals(predators, prey, food, bounds)
-            println(UnicodePlots.show(plt))
+            (plt, (_, _)) = draw_animals(predators, prey, food, bounds)
+            is_realtime = realtime ? " true" : "false"
+            hist = Base.string(UnicodePlots.histogram([p.energy for p in prey], nbins=6, closed=:left, xscale=:log10))
+            pred_hist = Base.string(UnicodePlots.histogram([p.energy for p in predators], nbins=6, closed=:left, xscale=:log10))
+            summary = @sprintf "\033[K fps: %5.1f predate: %d defend: %d eat: %d destroy: %d predator starved: %d prey starved: %d realtime: %s" (1/(tpf/1e9)) predate_count defend_count eat_count destroy_count predator_starve prey_starve is_realtime
+            output = string(string(plt, color=true), "\n", summary, "\n")
+            lines = countlines(IOBuffer(output))
+            print(output)
+            print("\033[J") # clear to end of screen
+            output = string("prey:\n", hist, "\n", "predators:\n", pred_hist, "\n")
+            lines += countlines(IOBuffer(output))
+            print(output)
             print("\033[s") # save cursor
-            print(string("\033[",height+2,"A")) # move up height+2 lines
+            print(string("\033[",lines,"A"))
             last_print = current
         end
+        target_step = prev + 1/target_fps * 1.0e9
+        if realtime && current < target_step
+            sleep((target_step - current)/1.0e9)
+        end
+        seconds = (current - prev)/1.0e9
+        alpha = 1 - exp(-0.001*seconds)
+        tpf = tpf * alpha + (1 - alpha) * (current - prev)
     end
 end
 
@@ -1014,11 +1176,11 @@ function cars()
     rng = Random.default_rng()
     Random.seed!(rng, 0)
     agents = [Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), params, arena) for _ in 1:pop_size]
-    history :: Vector{Vector{Tuple{Prob,Sampled,Body,Parent}}} = []
+    history :: Vector{Vector{Tuple{Prob,Body,Parent}}} = []
     prev = time_ns()
     last_print = 0
     tpf = 0.001
-    results = Vector{Tuple{Prob,Sampled}}(undef,(length(agents),))
+    results = Vector{Prob}(undef,(length(agents),))
     parents = [i for i in 1:length(agents)]
     frame = 0
     realtime = false
@@ -1029,23 +1191,24 @@ function cars()
             agent = agents[k]
             agent.age += 1
             agent.lineage += 1
-            (_, means, logvars, sampled) = updatecar(rng, agent, params, arena)
-            results[k] = (means, logvars), sampled[1]
+            (_, means, logvars, _) = updatecar(rng, agent, params, arena)
+            results[k] = (means, logvars)
         end
 
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
 
         if !any(alive)
             for i in 1:length(agents)
-                car = Car(rng, Float32(exp(-2.0-Random.rand(rng, Float32)*5.0)), params, arena)
-                replicatecar(rng, car, agents[i], arena)
+                agents[i].body = randomBody(arena)
                 alive[i] = true
             end
         end
 
 
         Threads.@threads for i in 1:length(agents)
-            if !alive[i]
+            if alive[i]
+                parents[i] = i
+            else
                 k = i
                 neighbour = mod1(k+rand([-1,1]), length(agents))
                 while !alive[neighbour]
@@ -1068,12 +1231,12 @@ function cars()
             end
         end
         function agent_step(k)
-            prob, sampled = results[k]
+            prob = results[k]
             body = agents[k].body
             parent = parents[k]
-            return (prob, sampled, body, parent)
+            return (prob, body, parent)
         end
-        @timeit to "step history" step :: Vector{Tuple{Prob, Sampled, Body, Parent}} = [agent_step(k) for k in 1:length(agents) ]
+        @timeit to "step history" step :: Vector{Tuple{Prob, Body, Parent}} = [agent_step(k) for k in 1:length(agents) ]
         pushfirst!(history, step)
         if length(history) > 200
             pop!(history)
@@ -1086,13 +1249,13 @@ function cars()
                 t = Threads.@spawn begin
                     agent = agents[k]
                     trajectory :: Array{Tuple{Prob, Body}} = []
-                    # index = argmax([agent.age for agent in agents])
-                    index = rand(1:pop_size)
+                    index = argmax([agent.age for agent in agents])
+                    # index = rand(1:pop_size)
                     while index == k
                         index = rand(1:pop_size)
                     end
                     for t in 1:length(history)
-                        prob, _, body, parent = history[t][index]
+                        prob, body, parent = history[t][index]
                         if parent == 0
                             return
                         end
