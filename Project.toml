@@ -4,9 +4,11 @@ authors = ["Viktor Kronvall <viktor.kronvall@gmail.com>"]
 version = "0.1.0"
 
 [deps]
+ColorSchemes = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 GeoInterface = "cf35fbd7-0cd7-5166-be24-54bfbe79505f"
 LibGEOS = "a90b1aa1-3769-5649-ba7e-abc5a9d163eb"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 NamedTupleTools = "d9ec5142-1e00-5aa0-9d6a-321866360f50"
@@ -19,5 +21,6 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 TERMIOS = "10233e3b-0d6c-416a-8c1a-d3d286bd6cd2"
+TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
 UnicodePlots = "b8865327-cd53-5732-bb35-84acbb429228"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
