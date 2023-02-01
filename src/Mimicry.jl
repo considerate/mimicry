@@ -47,6 +47,38 @@ struct KLLoss
     l :: Int64
 end
 
+#
+#  sensor_0   memory_0
+#     x    x   x
+#    turn_0  (memory_1 (+) memory_0)
+#
+#  sensor_1  memory_1
+#    x  x    x
+#    turn_1 (memory_2 (+) memory_1)
+#
+#  sensor_n  memory_n
+#    x  x    x
+#    turn_n memory_(n+1)
+#
+#
+# RNN(sensor_(n-21), memory_(n-21), θ) = {turn_(n-20) ... turn_(n+1)}
+# L(RNN)
+
+# p(turn_0, ..., turn_n | memory_0, sensor_0, ..., sensor_n, theta)
+
+# p(turn = 'L' | memory, sensor, theta) = sigmoid(...)
+#
+# (y,m') = W(x,m)j
+# loss_0 ~ L(fst(W(x_0, m_0)))
+# loss_1 ~ L(fst(W(x_1, m_1))) = L(fst(W(x_1, snd(W(x_0, m_0)))))
+# loss_0 + loss_1 = L(fst(W(x_0, m_0))) + L(fst(W(x_1, snd(W(x_0, m_0)))))
+#
+#
+# loss_0 + .... + loss_n
+#
+#
+
+
 function Lux.initialparameters(rng::Random.AbstractRNG, network :: Network)
     layers = NamedTupleTools.ntfromstruct(network)
     return Lux.initialparameters(rng, layers)
@@ -200,14 +232,12 @@ end
 mutable struct Car
     age :: Int64
     lineage :: Int64
-    feedback_nodes::Vector{Float32} # n_feedback_nodes
+    carry :: Tuple{Vector{Float32}, Vector{Float32}}
     body::Body
-    model::@NamedTuple{network::Network, loss::GaussLoss, mimic_loss::KLLoss}
+    model::CarModel
     parameters::NamedTuple
     state::NamedTuple
     optimiser_state :: NamedTuple
-    gradients :: NamedTuple
-    memory :: NamedTuple
 end
 
 # A Predator decides:
@@ -290,6 +320,45 @@ function initialmodel(rng, sizes)
     memory = (network=initialmemory(network, ps), loss=initialmemory(loss, nop), mimic_loss=initialmemory(mimic_loss,nop))
     model = (network=network,loss=loss,mimic_loss=mimic_loss)
     return (model, ps, st, grads, memory)
+end
+
+
+struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :classifier)}
+    lstm_cell:: Lux.LSTMCell
+    means :: Lux.Dense
+    logvars :: Lux.Dense
+end
+
+
+# model = CarModel(Lux.LSTMCell(...), Lux.Dense(..), Lux.Dense(..))
+# (means, logvars, new_carry) = model((x,carry), ps, st)
+
+# Run one step through the model
+function (model::CarModel)(inputs :: Tuple{AbstractArray, Tuple{AbstractArray, AbstractArray}}, ps :: NamedTuple, st :: NamedTuple)
+    (x, carry) = inputs
+    (y, new_carry), st_lstm = model.lstm_cell((x, carry), ps.lstm_cell, st.lstm_cell)
+    means, st_means = model.means(y, ps.means, st.means)
+    logvars, st_logvars = model.logvars(y, ps.logvars, st.logvars)
+    st = merge(st, (lstm_cell=st_lstm, means=st_means, logvars=st_logvars))
+    return (means, logvars, new_carry), st
+end
+
+function sequence_loss(model :: CarModel, initialcarry :: Tuple{AbstractArray, AbstractArray}, sequence :: Vector{Tuple{AbstractArray, Float32}}, ps :: NamedTuple, st :: NamedTuple)
+    carry = initialcarry
+    loss = 0.0
+    for (sensors, sampled) in sequence
+        (means, logvars, carry), st = model(sensors, carry, ps, st)
+        loss = loss + gaussloss(means, logvars, sampled)
+    end
+    return loss, st
+end
+
+
+function carmodel(rng, learning_rate, sensorSize, memorySize, arena)
+    model = CarModel(Lux.LSTMCell(sensorSize => memorySize, use_bias=true),
+                     Lux.Dense(memorySize => 1),
+                     Lux.Dense(memorySize => 1)
+                    )
 end
 
 function Car(rng :: Random.AbstractRNG, learning_rate :: Float32, params :: AgentParams, arena :: Arena)
