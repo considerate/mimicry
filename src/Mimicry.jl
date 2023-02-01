@@ -457,7 +457,7 @@ function cars()
     realtime = false
     target_fps = 30
     expectancy = 0.0
-    MAX_HISTORY = 100
+    MAX_HISTORY = 150
     while true
         Threads.@threads for k in 1:length(agents)
             agent = agents[k]
@@ -484,7 +484,6 @@ function cars()
                 parents[i] = i
             else
                 k = i
-                history[k] = []
                 neighbour = mod1(k+rand([-1,1]), length(agents))
                 while !alive[neighbour]
                     k = neighbour
@@ -494,14 +493,16 @@ function cars()
                 if expectancy == 0.0
                     expectancy = agents[i].age
                 else
-                    expectancy = 0.9 * expectancy + 0.1 * agents[i].age
+                    expectancy = 0.999 * expectancy + 0.001 * agents[i].age
                 end
                 agents[i].age = 0
                 new = replicatecar(rng, agents[neighbour], agents[i], arena)
                 if !new
                     parents[i] = neighbour
+                    history[i] = copy(history[neighbour])
                 else
                     parents[i] = 0
+                    history[i] = []
                 end
             end
         end
