@@ -108,11 +108,11 @@ end
 function (model::CarModel)(inputs :: Tuple{AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
     (x, (carry, carry2, carry3)) = inputs
     (y, new_carry), st_lstm = model.lstm_cell((x, carry), ps.lstm_cell, st.lstm_cell)
-    (y2, new_carry_2), st_lstm = model.lstm_cell((y, carry2), ps.lstm_cell2, st.lstm_cell2)
-    (y3, new_carry_3), st_lstm = model.lstm_cell((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
+    (y2, new_carry_2), st_lstm2 = model.lstm_cell2((y, carry2), ps.lstm_cell2, st.lstm_cell2)
+    (y3, new_carry_3), st_lstm3 = model.lstm_cell3((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
     means, st_means = model.means(y3, ps.means, st.means)
     logvars, st_logvars = model.logvars(y3, ps.logvars, st.logvars)
-    st = merge(st, (lstm_cell=st_lstm, means=st_means, logvars=st_logvars))
+    st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3, means=st_means, logvars=st_logvars))
     return (means, logvars, (new_carry, new_carry_2, new_carry_3)), st
 end
 
