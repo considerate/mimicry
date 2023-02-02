@@ -23,7 +23,7 @@ const Arena = Tuple{Polygon, Polygon, Bounds}
 
 const Prob = Tuple{Vector{Float32}, Vector{Float32}}
 const Sensors = Matrix{Float32}
-const Carry = Tuple{Matrix{Float32}, Matrix{Float32}}
+const Carry = Tuple{Tuple{Matrix{Float32}, Matrix{Float32}},Tuple{Matrix{Float32}, Matrix{Float32}},Tuple{Matrix{Float32}, Matrix{Float32}}}
 const Sampled = Float32
 const Parent = Int64
 
@@ -78,8 +78,10 @@ struct Body
     theta::Float32
 end
 
-struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :means, :logvars)}
+struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :lstm_cell2, :lstm_cell3, :means, :logvars)}
     lstm_cell:: Lux.LSTMCell
+    lstm_cell2:: Lux.LSTMCell
+    lstm_cell3:: Lux.LSTMCell
     means :: Lux.Dense
     logvars :: Lux.Dense
 end
@@ -103,16 +105,18 @@ end
 # (means, logvars, new_carry) = model((x,carry), ps, st)
 
 # Run one step through the model
-function (model::CarModel)(inputs :: Tuple{AbstractMatrix, Tuple{AbstractMatrix, AbstractMatrix}}, ps :: NamedTuple, st :: NamedTuple)
-    (x, carry) = inputs
+function (model::CarModel)(inputs :: Tuple{AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
+    (x, (carry, carry2, carry3)) = inputs
     (y, new_carry), st_lstm = model.lstm_cell((x, carry), ps.lstm_cell, st.lstm_cell)
-    means, st_means = model.means(y, ps.means, st.means)
-    logvars, st_logvars = model.logvars(y, ps.logvars, st.logvars)
+    (y2, new_carry_2), st_lstm = model.lstm_cell((y, carry2), ps.lstm_cell2, st.lstm_cell2)
+    (y3, new_carry_3), st_lstm = model.lstm_cell((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
+    means, st_means = model.means(y3, ps.means, st.means)
+    logvars, st_logvars = model.logvars(y3, ps.logvars, st.logvars)
     st = merge(st, (lstm_cell=st_lstm, means=st_means, logvars=st_logvars))
-    return (means, logvars, new_carry), st
+    return (means, logvars, (new_carry, new_carry_2, new_carry_3)), st
 end
 
-function sequence_loss(model :: CarModel, initialcarry :: Tuple{AbstractArray, AbstractArray}, sequence :: Vector{Tuple{Matrix{Float32}, Float32}}, ps :: NamedTuple, st :: NamedTuple)
+function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Float32}}, ps :: NamedTuple, st :: NamedTuple)
     carry = initialcarry
     loss = 0.0
     for (sensors, sampled) in sequence
@@ -122,29 +126,40 @@ function sequence_loss(model :: CarModel, initialcarry :: Tuple{AbstractArray, A
     return loss, st
 end
 
-function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Float32}, Tuple{Matrix{Float32}, Matrix{Float32}}}})
+function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Float32}, Carry}})
     if length(history) == 0
         return
     end
     (_, carry) = history[1]
     sequence = first.(history)
-    (loss, st), back = Zygote.pullback(p -> sequence_loss(agent.model, carry, sequence, p, agent.state), agent.parameters)
+    (_, st), back = Zygote.pullback(p -> sequence_loss(agent.model, carry, sequence, p, agent.state), agent.parameters)
     agent.state = st
     grads = back((1.0, nothing))[1]
     (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
     agent.optimiser_state = st_opt
     agent.parameters = ps
 end
+function newcarry(rng, sizes, batchsize=1) :: Carry
+    (a,b,c) = sizes
+    return (
+            (Lux.zeros32(rng, a, batchsize), Lux.zeros32(rng, a, batchsize)),
+            (Lux.zeros32(rng, b, batchsize), Lux.zeros32(rng, b, batchsize)),
+            (Lux.zeros32(rng, c, batchsize), Lux.zeros32(rng, c, batchsize)),
+           )
+end
 
-function Car(rng, learning_rate, sensorSize, hiddenSize, arena, batchsize=1)
-    model = CarModel(Lux.LSTMCell(sensorSize => hiddenSize, use_bias=true),
-                     Lux.Dense(hiddenSize => 1),
-                     Lux.Dense(hiddenSize => 1)
+function Car(rng, learning_rate, sensorSize, arena, batchsize=1)
+    (a,b,c) = (40,30,20)
+    model = CarModel(Lux.LSTMCell(sensorSize => a, use_bias=true),
+                     Lux.LSTMCell(a => b, use_bias=true),
+                     Lux.LSTMCell(b => c, use_bias=true),
+                     Lux.Dense(c => 1),
+                     Lux.Dense(c => 1)
                     )
     (ps, st) = Lux.setup(rng, model)
     body = randomBody(arena)
-    carry :: Carry = (Lux.zeros32(rng, hiddenSize, batchsize), Lux.zeros32(rng, hiddenSize, batchsize))
     st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
+    carry = newcarry(rng, (a,b,c), batchsize)
     return Car(0, 0, carry, body, model, ps, st, st_opt)
 end
 
@@ -331,24 +346,28 @@ end
     return (sensors, original_carry, means, logvars, output)
 end
 
+
+function replicatecarry(source :: Carry, target :: Carry)
+    function replicateone(a, b)
+        (s_memory, s_hidden_state) = a
+        (t_memory, t_hidden_state) = b
+        t_memory .= s_memory
+        t_hidden_state .= s_hidden_state
+    end
+    for (a,b) in zip(source, target)
+        replicateone(a, b)
+    end
+end
+
 @timeit to "replicate car" function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
     if Random.rand(rng) < 0.01
-        ps, st = Lux.setup(rng, target.model)
-        replicateparams(ps, target.parameters)
-        replicateparams(st, target.state)
-        target.lineage = 0
-        hiddenDims = target.model.lstm_cell.out_dims
-        (t_memory, t_hidden_state) = target.carry
-        t_memory .= Lux.zeros32(rng, hiddenDims, 1)
-        t_hidden_state .= Lux.zeros32(rng, hiddenDims, 1)
-        target.body = randomBody(arena)
+        input_dims = target.model.lstm_cell.in_dims
+        car = Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), input_dims, arena)
+        replicatecar(rng, car, target, arena)
         return true
     else
         target.model = source.model
-        (t_memory, t_hidden_state) = target.carry
-        (s_memory, s_hidden_state) = source.carry
-        t_memory .= s_memory
-        t_hidden_state .= s_hidden_state
+        replicatecarry(source.carry, target.carry)
         replicateparams(source.parameters, target.parameters)
         replicateparams(source.state, target.state)
         replicateparams(source.optimiser_state, target.optimiser_state)
@@ -447,7 +466,7 @@ function cars()
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), length(sensorParams), 20, arena) for _ in 1:pop_size]
+    agents = [Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), length(sensorParams), arena) for _ in 1:pop_size]
     history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry}}} = [[] for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
@@ -457,7 +476,7 @@ function cars()
     realtime = false
     target_fps = 30
     expectancy = 0.0
-    MAX_HISTORY = 150
+    MAX_HISTORY = 400
     while true
         Threads.@threads for k in 1:length(agents)
             agent = agents[k]
@@ -509,7 +528,7 @@ function cars()
 
         tasks = []
         for k in 1:length(agents)
-            if Random.rand() < 0.01
+            if (frame + k) % (MAX_HISTORY ÷ 4) == 0
                 t = Threads.@spawn train(agents[k], history[k])
                 push!(tasks, t)
             end
