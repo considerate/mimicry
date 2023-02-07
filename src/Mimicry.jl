@@ -24,7 +24,7 @@ const Arena = Tuple{Polygon, Polygon, Bounds}
 const Prob = Tuple{Vector{Float32}, Vector{Float32}}
 const Sensors = Matrix{Float32}
 const Carry = Tuple{Tuple{Matrix{Float32}, Matrix{Float32}},Tuple{Matrix{Float32}, Matrix{Float32}},Tuple{Matrix{Float32}, Matrix{Float32}}}
-const Sampled = Float32
+const Sampled = Int
 const Parent = Int64
 
 to = TimerOutput()
@@ -32,13 +32,6 @@ TimerOutputs.disable_timer!(to)
 
 function cleanup()
     print("\033[?25h") # show cursor
-end
-
-struct Network <: Lux.AbstractExplicitLayer
-    dense :: Lux.Dense
-    dense2 :: Lux.Dense
-    means :: Lux.Dense
-    logvars :: Lux.Dense
 end
 
 #
@@ -78,12 +71,12 @@ struct Body
     theta::Float32
 end
 
-struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :lstm_cell2, :lstm_cell3, :means, :logvars)}
+struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :lstm_cell2, :lstm_cell3, :dense, :motors)}
     lstm_cell:: Lux.LSTMCell
     lstm_cell2:: Lux.LSTMCell
     lstm_cell3:: Lux.LSTMCell
-    means :: Lux.Dense
-    logvars :: Lux.Dense
+    dense :: Lux.Dense
+    motors :: Lux.Dense
 end
 
 
@@ -106,38 +99,48 @@ end
 
 # Run one step through the model
 function (model::CarModel)(inputs :: Tuple{AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
-    (x, (carry, carry2, carry3)) = inputs
+    (x, (carry,carry2,carry3)) = inputs
+    z, st_dense = model.dense(x, ps.dense, st.dense)
     (y, new_carry), st_lstm = model.lstm_cell((x, carry), ps.lstm_cell, st.lstm_cell)
     (y2, new_carry_2), st_lstm2 = model.lstm_cell2((y, carry2), ps.lstm_cell2, st.lstm_cell2)
     (y3, new_carry_3), st_lstm3 = model.lstm_cell3((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
-    means, st_means = model.means(y3, ps.means, st.means)
-    logvars, st_logvars = model.logvars(y3, ps.logvars, st.logvars)
-    st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3, means=st_means, logvars=st_logvars))
-    return (means, logvars, (new_carry, new_carry_2, new_carry_3)), st
+    st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3))
+    mid = z .+ y3
+    motors, st_motors = model.motors(mid, ps.motors, st.motors)
+    st = merge(st, (motors=st_motors, dense=st_dense))
+    return (Lux.logsoftmax(motors), (new_carry, new_carry_2, new_carry_3)), st
 end
 
-function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Float32}}, ps :: NamedTuple, st :: NamedTuple)
+function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
     carry = initialcarry
     loss = 0.0
     for (sensors, sampled) in sequence
-        (means, logvars, carry), st = model((sensors, carry), ps, st)
-        loss = loss + gaussloss(means, logvars, sampled)
+        (motors, carry), st = model((sensors, carry), ps, st)
+        if !isfinite(loss)
+            println(means, logvars, sampled)
+            error("Infinite loss")
+        end
+        # instead of adding the loss at each step
+        # let's do traditional horizon prediction and only
+        # apply the loss for the predicted values
+        loss = loss + logloss(motors, sampled)
     end
     return loss, st
 end
 
-function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Float32}, Carry}})
+function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry}})
     if length(history) == 0
-        return
+        return 0.0
     end
     (_, carry) = history[1]
     sequence = first.(history)
-    (_, st), back = Zygote.pullback(p -> sequence_loss(agent.model, carry, sequence, p, agent.state), agent.parameters)
+    (loss, st), back = Zygote.pullback(p -> sequence_loss(agent.model, carry, sequence, p, agent.state), agent.parameters)
     agent.state = st
     grads = back((1.0, nothing))[1]
     (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
     agent.optimiser_state = st_opt
     agent.parameters = ps
+    return loss
 end
 function newcarry(rng, sizes, batchsize=1) :: Carry
     (a,b,c) = sizes
@@ -148,19 +151,38 @@ function newcarry(rng, sizes, batchsize=1) :: Carry
            )
 end
 
-function Car(rng, learning_rate, sensorSize, arena, batchsize=1)
+function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
     (a,b,c) = (40,30,20)
+    min_var = Float32(0.1)
+    min_logvar = log(min_var)
+    max_logvar = Float32(10)
     model = CarModel(Lux.LSTMCell(sensorSize => a, use_bias=true),
                      Lux.LSTMCell(a => b, use_bias=true),
                      Lux.LSTMCell(b => c, use_bias=true),
-                     Lux.Dense(c => 1),
-                     Lux.Dense(c => 1)
+                     Lux.Dense(sensorSize => c, Lux.relu),
+                     Lux.Dense(c => motorSize),
                     )
     (ps, st) = Lux.setup(rng, model)
-    body = randomBody(arena)
+    body = randomBody(rng, arena)
     st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
     carry = newcarry(rng, (a,b,c), batchsize)
     return Car(0, 0, carry, body, model, ps, st, st_opt)
+end
+
+function logloss(activations :: Matrix{Float32}, sampled::Int) :: Float32
+    return -activations[sampled, 1]
+end
+
+function sampleDiscrete(rng, activations :: Matrix{Float32})
+    probs = exp.(activations)
+    r = Random.rand(rng)
+    for i in 1:length(probs)
+        r -= probs[i, 1]
+        if r<=0.0
+            return i
+        end
+    end
+    return length(probs)
 end
 
 # TODO: be clear about the scalar nature of the matrices
@@ -168,18 +190,18 @@ function gaussloss(means :: Matrix{Float32}, logvars::Matrix{Float32}, sampled::
     return 0.5 * Lux.mean(logvars .+ (means .- sampled).^2 .* exp.(.-logvars))
 end
 
-function randompoint(bounds::Bounds) :: Point
+function randompoint(rng,bounds::Bounds) :: Point
     ((xmin,xmax), (ymin,ymax)) = bounds
-    x = rand()*(xmax-xmin) + xmin
-    y = rand()*(ymax-ymin) + ymin
+    x = Random.rand(rng)*(xmax-xmin) + xmin
+    y = Random.rand(rng)*(ymax-ymin) + ymin
     return (x,y)
 end
 
-function randomBody(arena :: Arena) :: Body
+function randomBody(rng, arena :: Arena) :: Body
     (_, _, bounds) = arena
-    theta = rand()*tau
+    theta = Random.rand(rng)*tau
     while true
-        p = randompoint(bounds)
+        p = randompoint(rng, bounds)
         if ontrack(p, arena)
             (x,y) = p
             return Body(x, y, theta)
@@ -311,9 +333,11 @@ function ontrack(p, arena :: Arena)
     return PolygonOps.inpolygon(p, outer) == 1 && PolygonOps.inpolygon(p, inner) == 0
 end
 
-function sample(means::Matrix{Float32},logvars::Matrix{Float32})::Matrix{Float32}
-    sigma = exp.(logvars*0.5)
-    return Float32.(randn(size(means))).*sigma + means
+function sample(rng, means::Matrix{Float32},logvars::Matrix{Float32})::Tuple{Matrix{Float32}, Matrix{Float32}}
+    sigma = exp.(logvars.*Float32(0.5))
+    normals = Random.randn(rng, Float32, size(means))
+    # println(uniforms, sigma, means)
+    return (normals, normals.*sigma .+ means)
 end
 
 function moveForward(rng :: Random.AbstractRNG, b::Body)
@@ -326,24 +350,22 @@ function moveForward(rng :: Random.AbstractRNG, b::Body)
     )
 end
 
-@timeit to "update car" function updatecar(rng, agent::Car, sensorParams, arena :: Arena)
-    sensors = reshape(sensorValues(agent.body, sensorParams, arena),:,1)
+@timeit to "update car" function updatecar(rng, agent::Car, sensorParams, motorParams, arena :: Arena)
+    values = sensorValues(agent.body, sensorParams, arena)
+    sensors = reshape(values,length(values),1)
     original_carry = agent.carry
     inputs = (sensors, original_carry)
-    (means, logvars, carry), st = agent.model(inputs, agent.parameters, agent.state)
+    (motors, carry), st = agent.model(inputs, agent.parameters, agent.state)
     agent.carry = carry
     agent.state = st
-    sampled = sample(means, logvars)
-    output = sampled[1, 1]
-    if isnan(output)
-        # we take a zero-tolerance approach to NaNs here - if you output one
-        # you are immediately teleported outside the arena and die.
-        agent.body = Body(-1000.0,-1000.0,0.0)
-        # Avoid propagating the NaNs elsewhere
-        output = 0
+    if !all(map(isfinite, motors))
+        println(motors)
+        error("Non-finite motor outputs")
     end
+    sampled = sampleDiscrete(rng, motors)
+    output = motorParams[sampled]
     agent.body = moveForward(rng, turn(agent.body,output))
-    return (sensors, original_carry, means, logvars, output)
+    return (sensors, original_carry, motors, sampled)
 end
 
 
@@ -360,7 +382,7 @@ function replicatecarry(source :: Carry, target :: Carry)
 end
 
 @timeit to "replicate car" function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
-    if Random.rand(rng) < 0.01
+    if Random.rand(rng) < 0.0
         input_dims = target.model.lstm_cell.in_dims
         car = Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), input_dims, arena)
         replicatecar(rng, car, target, arena)
@@ -370,12 +392,11 @@ end
         replicatecarry(source.carry, target.carry)
         replicateparams(source.parameters, target.parameters)
         replicateparams(source.state, target.state)
-        replicateparams(source.optimiser_state, target.optimiser_state)
+        # replicateparams(source.optimiser_state, target.optimiser_state)
         target.lineage = source.lineage
         target.body = source.body
         return false
     end
-
 end
 
 
@@ -415,44 +436,10 @@ function replicateparams(source :: NamedTuple, target :: NamedTuple)
     return NamedTuple{keys(source)}(map(replicatekey, keys(source)))
 end
 
-
-# @timeit to "train_mimic" function train_mimic(agent, inputs :: Vector{Float32}, targets :: Prob)
-#     (probs, st1) = network_forward(agent.model.network,inputs, agent.parameters, agent.state, agent.memory.network)
-#     loss = divergence_forward(agent.model.mimic_loss, (probs.means, probs.logvars), targets, agent.memory.mimic_loss)
-#     divergence_back(agent.model.mimic_loss, Float32(1.0), agent.gradients.mimic_loss, agent.memory.mimic_loss)
-#     network_back(agent.model.network, agent.gradients.mimic_loss, agent.parameters, agent.gradients.network, agent.memory.network)
-#     return (loss, probs)
-# end
-
-# function mimic(agent::Car, params :: AgentParams, arena :: Arena, trajectory::Array{Tuple{Prob,Body}})
-#     mid = length(trajectory) ÷ 2
-#     if mid == 0
-#         return
-#     end
-#     original_feedback = copy(agent.feedback_nodes)
-#     warmup = trajectory[1:mid]
-#     training = trajectory[mid+1:end]
-#     # replay trajectory to warm up feedback_nodes
-#     for (_, body) in warmup
-#         sensors = sensorValues(body, params, arena)
-#         inputs = [sensors; agent.feedback_nodes*1.0]
-#         prob, _ = network_forward(agent.model.network, inputs, agent.parameters, agent.state, agent.memory.network)
-#         outputs = sample(prob.means, prob.logvars)
-#         feedback = outputs[2:end]
-#         agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
-#     end
-#     for (prob, body) in training
-#         sensors = sensorValues(body, params, arena)
-#         inputs :: Vector{Float32} = [sensors; agent.feedback_nodes*1.0]
-#         # train on last step of trajectory
-#         (_,probs) = train_mimic(agent, inputs, prob)
-#         outputs = sample(probs.means, probs.logvars)
-#         feedback = outputs[2:end]
-#         agent.feedback_nodes .= update_feedback(agent.feedback_nodes, feedback)
-#     end
-#     # revert feedback_nodes for the agent
-#     agent.feedback_nodes .= original_feedback
-# end
+function random_lr(rng)
+    return Float32(exp(-4.0)) # selected by fair dice roll
+    # return Float32.(exp(-3.0-Random.rand(rng, Float32)*5.0))
+end
 
 function cars()
     Base.start_reading(stdin)
@@ -463,10 +450,11 @@ function cars()
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
         for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25]
     ]
-    pop_size = 500
+    motorParams = [-1, -0.5, -0.1, 0, 0.1, 0.5, 1]
+    pop_size = 200
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), length(sensorParams), arena) for _ in 1:pop_size]
+    agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
     history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry}}} = [[] for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
@@ -476,24 +464,31 @@ function cars()
     realtime = false
     target_fps = 30
     expectancy = 0.0
-    MAX_HISTORY = 400
+    MAX_HISTORY = 50
+    empty :: Matrix{Float32} = Float32.([0.0 0.0])
     while true
+        motorss :: Vector{Matrix{Float32}} = [empty for _ in agents]
         Threads.@threads for k in 1:length(agents)
             agent = agents[k]
             agent.age += 1
             agent.lineage += 1
-            (sensors, carry, _, _, sampled) = updatecar(rng, agent, sensorParams, arena)
+            (sensors, carry, motors, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
+            motorss[k] = exp.(motors)
             push!(history[k], ((sensors,sampled), carry))
             if length(history[k]) > MAX_HISTORY
                 popfirst!(history[k])
             end
         end
+        motor = Lux.mean(motorss)
 
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
 
         if !any(alive)
             for i in 1:length(agents)
-                agents[i].body = randomBody(arena)
+                agents[i].body = randomBody(rng, arena)
+                agents[i].age = 0
+                #replicatecar(rng, Car(rng, random_lr(rng), length(sensorParams), arena), agents[i], arena)
+                history[i] = []
                 alive[i] = true
             end
         end
@@ -503,10 +498,11 @@ function cars()
                 parents[i] = i
             else
                 k = i
-                neighbour = mod1(k+rand([-1,1]), length(agents))
+                neighbour = Random.rand(rng, 1:length(agents)) # mod1(k+rand([-1,1]), length(agents))
                 while !alive[neighbour]
                     k = neighbour
-                    neighbour = mod1(k+rand([-1,1]), length(agents))
+                    # neighbour = mod1(k+rand([-1,1]), length(agents))
+                    neighbour = Random.rand(rng, 1:length(agents)) # mod1(k+rand([-1,1]), length(agents))
                 end
                 @assert alive[neighbour]
                 if expectancy == 0.0
@@ -514,22 +510,28 @@ function cars()
                 else
                     expectancy = 0.999 * expectancy + 0.001 * agents[i].age
                 end
+                # agents[i] = deepcopy(agents[neighbour])
+                replicatecar(rng, agents[neighbour], agents[i], arena)
                 agents[i].age = 0
-                new = replicatecar(rng, agents[neighbour], agents[i], arena)
-                if !new
-                    parents[i] = neighbour
-                    history[i] = copy(history[neighbour])
-                else
-                    parents[i] = 0
-                    history[i] = []
-                end
+                history[i] = copy(history[neighbour])
+                #if !new
+                #    parents[i] = neighbour
+                #    history[i] = copy(history[neighbour])
+                #else
+                #    parents[i] = 0
+                #    history[i] = []
+                #end
             end
         end
 
         tasks = []
+        losses = [0.0 for _ in agents]
         for k in 1:length(agents)
-            if (frame + k) % (MAX_HISTORY ÷ 4) == 0
-                t = Threads.@spawn train(agents[k], history[k])
+            if (frame + k) % (MAX_HISTORY ÷ 10) == 0
+                t = Threads.@spawn begin
+                    l = train(agents[k], history[k])
+                    losses[k] += l
+                end
                 push!(tasks, t)
             end
         end
@@ -556,9 +558,9 @@ function cars()
             elapsed = current - started
             full_fps =1/(elapsed/(frame*1e9))
             is_realtime = realtime ? "true" : "false"
-            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy
+            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy Lux.mean(losses)
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
-            output = string(chart, "\n", profiling, summary, "\n", hist, "\n")
+            output = string(chart, "\n", profiling, summary, "\n", motor, "\n", hist, "\n")
             lines = countlines(IOBuffer(output))
             print(output)
             print("\033[s") # save cursor

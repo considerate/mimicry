@@ -4,7 +4,7 @@
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
     flake-utils.inputs.nixpkgs.follows = "nixpkgs";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-22.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-22.11";
   };
 
   outputs =
@@ -21,7 +21,7 @@
           fhs = pkgs.buildFHSUserEnv {
             name = "mimicry-env";
             targetPkgs = pkgs: [
-              pkgs.julia_17-bin
+              pkgs.julia
               pkgs.qt5.qtbase
               pkgs.glib.dev
               pkgs.xorg.libX11
@@ -54,6 +54,8 @@
               pkgs.neovim
               # memory
               pkgs.valgrind
+              pkgs.zee
+              pkgs.helix
             ];
             multiPkgs = pkgs: (with pkgs;
               [
