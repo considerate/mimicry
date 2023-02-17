@@ -13,6 +13,7 @@ import Random
 using TimerOutputs
 import LinearAlgebra
 import ColorSchemes
+import Plots
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float32}}
@@ -98,10 +99,10 @@ end
 # (means, logvars, new_carry) = model((x,carry), ps, st)
 
 # Run one step through the model
-function (model::CarModel)(inputs :: Tuple{AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
-    (x, (carry,carry2,carry3)) = inputs
+function (model::CarModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
+    (x, x2, (carry,carry2,carry3)) = inputs
     z, st_dense = model.dense(x, ps.dense, st.dense)
-    (y, new_carry), st_lstm = model.lstm_cell((x, carry), ps.lstm_cell, st.lstm_cell)
+    (y, new_carry), st_lstm = model.lstm_cell((x2, carry), ps.lstm_cell, st.lstm_cell)
     (y2, new_carry_2), st_lstm2 = model.lstm_cell2((y, carry2), ps.lstm_cell2, st.lstm_cell2)
     (y3, new_carry_3), st_lstm3 = model.lstm_cell3((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
     st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3))
@@ -111,11 +112,11 @@ function (model::CarModel)(inputs :: Tuple{AbstractMatrix, Carry}, ps :: NamedTu
     return (Lux.logsoftmax(motors), (new_carry, new_carry_2, new_carry_3)), st
 end
 
-function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
+function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
     carry = initialcarry
     loss = 0.0
-    for (sensors, sampled) in sequence
-        (motors, carry), st = model((sensors, carry), ps, st)
+    for (sensors, sensors2, sampled) in sequence
+        (motors, carry), st = model((sensors, sensors2, carry), ps, st)
         if !isfinite(loss)
             println(means, logvars, sampled)
             error("Infinite loss")
@@ -130,17 +131,24 @@ end
 
 function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry}})
     if length(history) == 0
-        return 0.0
+        return (0.0, 0f0, 0f0)
     end
     (_, carry) = history[1]
     sequence = first.(history)
-    (loss, st), back = Zygote.pullback(p -> sequence_loss(agent.model, carry, sequence, p, agent.state), agent.parameters)
+    wrt = (params=agent.parameters, inputs=[(x,x,sampled) for (x,sampled) in sequence])
+    (loss, st), back = Zygote.pullback(x -> sequence_loss(agent.model, carry, x.inputs, x.params, agent.state), wrt)
     agent.state = st
     grads = back((1.0, nothing))[1]
-    (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
+    a = 0.0f0
+    b = 0.0f0
+    for (g, g2, _) in grads.inputs
+        a += sum(g .* g)
+        b += sum(g2 .* g2)
+    end
+    (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads.params)
     agent.optimiser_state = st_opt
     agent.parameters = ps
-    return loss
+    return (loss, sqrt(a), sqrt(b))
 end
 function newcarry(rng, sizes, batchsize=1) :: Carry
     (a,b,c) = sizes
@@ -151,6 +159,10 @@ function newcarry(rng, sizes, batchsize=1) :: Carry
            )
 end
 
+function scaled_glorot(rng, dims :: Integer...)
+    return Lux.glorot_uniform(rng, dims...; gain=0.5f0)
+end
+
 function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
     (a,b,c) = (40,30,20)
     min_var = Float32(0.1)
@@ -159,8 +171,8 @@ function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
     model = CarModel(Lux.LSTMCell(sensorSize => a, use_bias=true),
                      Lux.LSTMCell(a => b, use_bias=true),
                      Lux.LSTMCell(b => c, use_bias=true),
-                     Lux.Dense(sensorSize => c, Lux.relu),
-                     Lux.Dense(c => motorSize),
+                     Lux.Dense(sensorSize => c, Lux.relu, init_weight=scaled_glorot),
+                     Lux.Dense(c => motorSize, init_weight=scaled_glorot),
                     )
     (ps, st) = Lux.setup(rng, model)
     body = randomBody(rng, arena)
@@ -354,7 +366,7 @@ end
     values = sensorValues(agent.body, sensorParams, arena)
     sensors = reshape(values,length(values),1)
     original_carry = agent.carry
-    inputs = (sensors, original_carry)
+    inputs = (sensors, sensors, original_carry)
     (motors, carry), st = agent.model(inputs, agent.parameters, agent.state)
     agent.carry = carry
     agent.state = st
@@ -529,15 +541,16 @@ function cars()
         for k in 1:length(agents)
             if (frame + k) % (MAX_HISTORY ÷ 10) == 0
                 t = Threads.@spawn begin
-                    l = train(agents[k], history[k])
+                    (l, a, b) = train(agents[k], history[k])
                     losses[k] += l
+                    return (a,b)
                 end
                 push!(tasks, t)
             end
         end
-        for t in tasks
-            Threads.wait(t)
-        end
+        results = [fetch(t) for t in tasks]
+        dense_grads = Lux.mean([a for (a,_) in results])
+        lstm_grads = Lux.mean([b for (_,b) in results])
 
         current = time_ns()
         if current - last_print > 0.05e9
@@ -560,7 +573,7 @@ function cars()
             is_realtime = realtime ? "true" : "false"
             summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy Lux.mean(losses)
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
-            output = string(chart, "\n", profiling, summary, "\n", motor, "\n", hist, "\n")
+            output = string(chart, "\n", profiling, summary, "\n", motor, "\n", hist, "\n", "\n\n", dense_grads, " : ", lstm_grads, "\n\n")
             lines = countlines(IOBuffer(output))
             print(output)
             print("\033[s") # save cursor
