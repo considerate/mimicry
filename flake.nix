@@ -15,14 +15,22 @@
       inputs.flake-utils.lib.eachDefaultSystem
         (system:
         let
-          pkgs = inputs.nixpkgs.legacyPackages.${system}.appendOverlays [
-            self.overlays.default
-          ];
+          pkgs = import inputs.nixpkgs {
+            inherit system;
+            config = {
+              permittedInsecurePackages = [
+                "qtwebkit-5.212.0-alpha4"
+              ];
+            };
+            overlays = [
+              self.overlays.default
+            ];
+          };
           fhs = pkgs.buildFHSUserEnv {
             name = "mimicry-env";
             targetPkgs = pkgs: [
               pkgs.julia
-              pkgs.qt5.qtbase
+              # pkgs.qt5.full
               pkgs.glib.dev
               pkgs.xorg.libX11
               pkgs.xorg.libXcursor
@@ -30,8 +38,8 @@
               pkgs.xorg.libXt
               pkgs.xorg.libXrender
               pkgs.xorg.libXext
-              pkgs.mesa
-              pkgs.cairo.dev
+              # pkgs.mesa
+              # pkgs.cairo.dev
               pkgs.dbus.dev
               pkgs.iana-etc
               pkgs.dbus.lib
@@ -53,9 +61,9 @@
               # dev environment
               pkgs.neovim
               # memory
-              pkgs.valgrind
-              pkgs.zee
-              pkgs.helix
+              # pkgs.valgrind
+              # pkgs.zee
+              # pkgs.helix
             ];
             multiPkgs = pkgs: (with pkgs;
               [
