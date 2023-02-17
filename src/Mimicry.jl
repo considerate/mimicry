@@ -453,10 +453,54 @@ function random_lr(rng)
     # return Float32.(exp(-3.0-Random.rand(rng, Float32)*5.0))
 end
 
+function create_plot(arena)
+    (_, _, bounds) = arena
+    ((xmin, xmax), (ymin, ymax)) = bounds
+    return Plots.plot(
+        xlims=(xmin,xmax),
+        ylims=(ymin,ymax),
+        axis=([],false),
+        grid=false,
+        color=nothing,
+        legend=false,
+    )
+end
+
+function plot_arena!(plt, arena)
+    (polygon, inner, bounds) = arena
+    ((xmin, xmax), (ymin, ymax)) = bounds
+    xs = getindex.(polygon, 1)
+    ys = getindex.(polygon, 2)
+    Plots.plot!(plt, Plots.Shape(xs, ys),color="white")
+    xs = getindex.(inner, 1)
+    ys = getindex.(inner, 2)
+    Plots.plot!(plt, Plots.Shape(xs,ys),color="white")
+end
+
+
+function plot_body!(plt, b::Body)
+    shape = Plots.Shape(
+                [b.x + 0.05*sin(b.theta),
+                b.x + 0.015*sin(b.theta + tau/3),
+                b.x + 0.015*sin(b.theta - tau/3),
+                b.x + 0.05*sin(b.theta)         ],
+                [ b.y + 0.05*cos(b.theta),
+                 b.y + 0.015*cos(b.theta + tau/3),
+                 b.y + 0.015*cos(b.theta - tau/3),
+                 b.y + 0.05*cos(b.theta)])
+    Plots.plot!(plt,shape,color="blue",linecolor=nothing)
+end
+
+function plot_sensors!(plt, b::Body, sensorParams)
+    sensors = sensorPoints(b, sensorParams)
+    Plots.scatter!(plt,getindex.(sensors,1), getindex.(sensors,2), markersize=2,linecolor=nothing,color="red")
+end
+
 function cars()
     Base.start_reading(stdin)
     started = time_ns()
     arena = createArena()
+    guiplot = create_plot(arena)
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -551,6 +595,14 @@ function cars()
         results = [fetch(t) for t in tasks]
         dense_grads = Lux.mean([a for (a,_) in results])
         lstm_grads = Lux.mean([b for (_,b) in results])
+
+        Plots.empty!(guiplot)
+        plot_arena!(guiplot, arena)
+        for agent in agents
+            plot_body!(guiplot, agent.body)
+        end
+        plot_sensors!(guiplot, agents[1].body, sensorParams)
+        Plots.display(guiplot)
 
         current = time_ns()
         if current - last_print > 0.05e9
