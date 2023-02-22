@@ -543,7 +543,7 @@ end
 function plot_cars(arena, trails, agents, sensorParams)
     (polygon, inner, bounds) = arena
     (xlims, ylims) = bounds
-    fig = GLMakie.Figure(resolution = (1280, 720))
+    fig = GLMakie.Figure(resolution = (1920, 1080))
     ax = GLMakie.Axis(fig[1, 1])
     GLMakie.hidedecorations!(ax)  # hides ticks, grid and lables
     GLMakie.hidespines!(ax)
@@ -598,20 +598,35 @@ function cars()
     agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
     trails :: Vector{Vector{Vector{Tuple{Body,Body}}}} = [[[]] for _ in 1:pop_size]
     (fig, makie_bodies, makie_sensors, makie_trails) = plot_cars(arena, trails, agents, sensorParams)
-    display(fig)
     history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Body, Body}}} = [[] for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
     tpf = 0.001
     parents = [i for i in 1:length(agents)]
-    frame = 0
     realtime = false
     target_fps = 30
     expectancy = 0.0
     MAX_HISTORY = 100
     MAX_TRAIL = 40
     empty :: Matrix{Float32} = Float32.([0.0 0.0])
-    while true
+    showwindow = false
+    frames = 1:100000
+    deathsperframe = 0.0
+    halflife = 250.0 # frames
+    decay = 1 - 2^(-1/halflife)
+    if showwindow
+        display(fig)
+        loop = f -> open("mimicry.csv", "w+") do io
+            println(io, "frame,deaths,deaths_per_frame,max_age,mean_age,loss")
+            foreach(x -> f(x, io), frames)
+        end
+    else
+        loop = f -> open("mimicry.csv", "w+") do io
+            println(io, "frame,deaths,deaths_per_frame,max_age,mean_age,loss")
+            GLMakie.record(x -> f(x,io), fig, "animation.mp4", frames; framerate=12, compression=14)
+        end
+    end
+    loop() do frame, csv
         motorss :: Vector{Matrix{Float32}} = [empty for _ in agents]
         Threads.@threads for k in 1:length(agents)
             agent = agents[k]
@@ -637,12 +652,12 @@ function cars()
         motor = Lux.mean(motorss)
 
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
-
+        deaths = sum([ a ? 0 : 1 for a in alive])
+        deathsperframe = deathsperframe * decay + deaths * (1 - decay)
         if !any(alive)
             for i in 1:length(agents)
                 agents[i].body = randomBody(rng, arena)
                 agents[i].age = 0
-                #replicatecar(rng, Car(rng, random_lr(rng), length(sensorParams), arena), agents[i], arena)
                 history[i] = []
                 trails[i] = [[]]
                 alive[i] = true
@@ -707,8 +722,13 @@ function cars()
         yield() # TODO: replace with yield() if that works
 
         current = time_ns()
+        ages = [agent.age for agent in agents]
+        longest_lineage = maximum([agent.lineage for agent in agents])
+        mean_age = sum(ages) / length(agents)
+        max_age = maximum(ages)
+        loss = Lux.mean(losses)
+        println(csv, frame, ",", deaths, ",", deathsperframe, ",", max_age, ",", mean_age, ",", loss)
         if current - last_print > 0.05e9
-            ages = [agent.age for agent in agents]
             (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents], ages)
             if to.enabled
                 io = PipeBuffer()
@@ -719,13 +739,10 @@ function cars()
             end
 
             chart = Base.string(plt, color=true)
-            mean_age = sum(ages) / length(agents)
-            max_age = maximum(ages)
-            longest_lineage = maximum([agent.lineage for agent in agents])
             elapsed = current - started
-            full_fps =1/(elapsed/(frame*1e9))
+            full_fps = 1/(elapsed/(frame*1e9))
             is_realtime = realtime ? "true" : "false"
-            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy Lux.mean(losses)
+            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy loss
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
             output = string(chart, "\n", profiling, summary, "\n", motor, "\n", hist, "\n", "\n\n", dense_grads, " : ", lstm_grads, "\n\n")
             lines = countlines(IOBuffer(output))
@@ -751,7 +768,6 @@ function cars()
         alpha = 1 - exp(-0.001*seconds)
         tpf = tpf * alpha + (1 - alpha) * diff
         prev = current
-        frame += 1
     end
 end
 
