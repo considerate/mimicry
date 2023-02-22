@@ -13,7 +13,9 @@ import Random
 using TimerOutputs
 import LinearAlgebra
 import ColorSchemes
-import Plots
+# import Plots
+import Colors
+import GLMakie
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float32}}
@@ -30,6 +32,8 @@ const Parent = Int64
 
 to = TimerOutput()
 TimerOutputs.disable_timer!(to)
+
+GLMakie.activate!()
 
 function cleanup()
     print("\033[?25h") # show cursor
@@ -477,6 +481,31 @@ function plot_arena!(plt, arena)
     Plots.plot!(plt, Plots.Shape(xs,ys),color="white")
 end
 
+function car_polygon(b)
+    return GLMakie.Polygon([
+      GLMakie.Point2f(
+                      b.x + 0.05*sin(b.theta),
+                      b.y + 0.05*cos(b.theta),
+                     ),
+      GLMakie.Point2f(
+                      b.x + 0.015*sin(b.theta + tau/3),
+                      b.y + 0.015*cos(b.theta + tau/3),
+                     ),
+      GLMakie.Point2f(
+                      b.x + 0.015*sin(b.theta - tau/3),
+                      b.y + 0.015*cos(b.theta - tau/3),
+               ),
+      GLMakie.Point2f(
+                      b.x + 0.05*sin(b.theta),
+                      b.y + 0.05*cos(b.theta),
+               ),
+     ])
+end
+
+function makie_plot_body!(ax, b::Body)
+    points = car_polygon(b)
+    GLMakie.poly!(ax, points ,color="blue",linecolor=nothing)
+end
 
 function plot_body!(plt, b::Body)
     shape = Plots.Shape(
@@ -491,16 +520,72 @@ function plot_body!(plt, b::Body)
     Plots.plot!(plt,shape,color="blue",linecolor=nothing)
 end
 
+function plot_trail!(plt, trail)
+    for segments in trail
+        befores :: Vector{Body} = getindex.(segments,1)
+        Plots.plot!(plt,map(b -> b.x, befores),map(b -> b.y, befores),linecolor=Colors.RGBA(0,0,0,0.3), linewidth=0.2)
+    end
+end
+
 function plot_sensors!(plt, b::Body, sensorParams)
     sensors = sensorPoints(b, sensorParams)
     Plots.scatter!(plt,getindex.(sensors,1), getindex.(sensors,2), markersize=2,linecolor=nothing,color="red")
+end
+
+function traillength(trail)
+    return sum([length(t) for t in trail])
+end
+
+function to_poly(ps)
+    GLMakie.Polygon([GLMakie.Point2f(p[1], p[2]) for p in ps])
+end
+
+function plot_cars(arena, trails, agents, sensorParams)
+    (polygon, inner, bounds) = arena
+    (xlims, ylims) = bounds
+    fig = GLMakie.Figure(resolution = (1280, 720))
+    ax = GLMakie.Axis(fig[1, 1])
+    GLMakie.hidedecorations!(ax)  # hides ticks, grid and lables
+    GLMakie.hidespines!(ax)
+    GLMakie.limits!(ax, xlims, ylims)
+    makie_bodies = GLMakie.Observable([agent.body for agent in agents])
+    makie_cars = GLMakie.lift(xs -> car_polygon.(xs), makie_bodies)
+    makie_sensors = GLMakie.Observable(sensorPoints(agents[1].body, sensorParams))
+    makie_trails = GLMakie.Observable(trails)
+    makie_trail_segments = GLMakie.Observable(GLMakie.Point2f[])
+    makie_trail_colors = GLMakie.Observable(Bool[])
+    function update_trails(ts)
+        makie_trail_segments[]
+        makie_trail_colors[]
+        empty!(makie_trail_segments[])
+        empty!(makie_trail_colors[])
+        for trail in ts
+            for (k,segments) in enumerate(trail)
+                for (before, after) in segments
+                    push!(makie_trail_segments[], GLMakie.Point2f(before.x, before.y))
+                    push!(makie_trail_segments[], GLMakie.Point2f(after.x, after.y))
+                    push!(makie_trail_colors[], k == length(trail))
+                end
+            end
+        end
+        makie_trail_segments[] = makie_trail_segments[]
+        makie_trail_colors[] = makie_trail_colors[]
+    end
+    colormap = [Colors.RGBA(1.0,0,0,0.2),Colors.RGBA(0,0,0,0.2)]
+    GLMakie.on(update_trails, makie_trails)
+    update_trails(makie_trails[])
+    GLMakie.poly!(ax,to_poly(polygon);color=:transparent,strokewidth=1,strokecolor=:gray)
+    GLMakie.poly!(ax,to_poly(inner);color=:transparent,strokewidth=1,strokecolor=:gray)
+    GLMakie.linesegments!(ax, makie_trail_segments, color = makie_trail_colors, colormap = colormap)
+    GLMakie.poly!(ax, makie_cars,color=GLMakie.Cycled(1))
+    GLMakie.scatter!(ax, makie_sensors,color=GLMakie.Cycled(2))
+    return (fig, makie_bodies, makie_sensors, makie_trails)
 end
 
 function cars()
     Base.start_reading(stdin)
     started = time_ns()
     arena = createArena()
-    guiplot = create_plot(arena)
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -511,7 +596,10 @@ function cars()
     rng = Random.default_rng()
     Random.seed!(rng, 0)
     agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
-    history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry}}} = [[] for _ in 1:pop_size]
+    trails :: Vector{Vector{Vector{Tuple{Body,Body}}}} = [[[]] for _ in 1:pop_size]
+    (fig, makie_bodies, makie_sensors, makie_trails) = plot_cars(arena, trails, agents, sensorParams)
+    display(fig)
+    history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Body, Body}}} = [[] for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
     tpf = 0.001
@@ -520,7 +608,8 @@ function cars()
     realtime = false
     target_fps = 30
     expectancy = 0.0
-    MAX_HISTORY = 50
+    MAX_HISTORY = 100
+    MAX_TRAIL = 40
     empty :: Matrix{Float32} = Float32.([0.0 0.0])
     while true
         motorss :: Vector{Matrix{Float32}} = [empty for _ in agents]
@@ -528,11 +617,21 @@ function cars()
             agent = agents[k]
             agent.age += 1
             agent.lineage += 1
+            body = agent.body
             (sensors, carry, motors, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
             motorss[k] = exp.(motors)
-            push!(history[k], ((sensors,sampled), carry))
+            push!(history[k], ((sensors,sampled), carry, body, agent.body))
+            push!(trails[k][end], (body, agent.body))
             if length(history[k]) > MAX_HISTORY
                 popfirst!(history[k])
+            end
+            if traillength(trails[k]) > MAX_TRAIL
+                while length(trails[k][1]) == 0
+                    popfirst!(trails[k])
+                end
+                if length(trails[k]) > 0
+                    popfirst!(trails[k][1])
+                end
             end
         end
         motor = Lux.mean(motorss)
@@ -545,6 +644,7 @@ function cars()
                 agents[i].age = 0
                 #replicatecar(rng, Car(rng, random_lr(rng), length(sensorParams), arena), agents[i], arena)
                 history[i] = []
+                trails[i] = [[]]
                 alive[i] = true
             end
         end
@@ -570,6 +670,9 @@ function cars()
                 replicatecar(rng, agents[neighbour], agents[i], arena)
                 agents[i].age = 0
                 history[i] = copy(history[neighbour])
+                if length(trails[i][end]) > 0
+                    push!(trails[i], [])
+                end
                 #if !new
                 #    parents[i] = neighbour
                 #    history[i] = copy(history[neighbour])
@@ -580,12 +683,13 @@ function cars()
             end
         end
 
+
         tasks = []
         losses = [0.0 for _ in agents]
         for k in 1:length(agents)
             if (frame + k) % (MAX_HISTORY ÷ 10) == 0
                 t = Threads.@spawn begin
-                    (l, a, b) = train(agents[k], history[k])
+                    (l, a, b) = train(agents[k], [(values, carry) for (values, carry, _, _) in history[k]])
                     losses[k] += l
                     return (a,b)
                 end
@@ -596,13 +700,11 @@ function cars()
         dense_grads = Lux.mean([a for (a,_) in results])
         lstm_grads = Lux.mean([b for (_,b) in results])
 
-        Plots.empty!(guiplot)
-        plot_arena!(guiplot, arena)
-        for agent in agents
-            plot_body!(guiplot, agent.body)
-        end
-        plot_sensors!(guiplot, agents[1].body, sensorParams)
-        Plots.display(guiplot)
+        # Update our plot state
+        makie_bodies[] = [agent.body for agent in agents]
+        makie_sensors[] = sensorPoints(agents[1].body, sensorParams)
+        makie_trails[] = copy(trails)
+        yield() # TODO: replace with yield() if that works
 
         current = time_ns()
         if current - last_print > 0.05e9
