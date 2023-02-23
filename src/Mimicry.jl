@@ -13,9 +13,9 @@ import Random
 using TimerOutputs
 import LinearAlgebra
 import ColorSchemes
-# import Plots
 import Colors
 import GLMakie
+import Dates
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float32}}
@@ -233,6 +233,40 @@ function turn(b :: Body, amount)
         b.y,
         b.theta + tanh(amount)*turnRate,
     )
+end
+
+function createLetterArena() :: Arena
+    vertices = [
+        (0.0, 0.0),
+        (0.0, 2.0),
+        (1.0, 1.5),
+        (2.0, 2.0),
+        (2.0, 0.0),
+        (0.0, 0.0),
+    ]
+    outer :: Polygon  = [
+        (-0.2, -0.2),
+        (-0.2,  2.2),
+        ( 0.2,  2.2),
+        ( 1.0,  1.7),
+        ( 1.8,  2.2),
+        ( 2.2,  2.2),
+        ( 2.2, -0.2),
+        (-0.2, -0.2),
+    ]
+    inner :: Polygon = [
+        (0.2, 0.2),
+        (0.2, 1.8),
+        (1.0, 1.3),
+        (1.8, 1.8),
+        (1.8, 0.2),
+        (0.2, 0.2),
+    ]
+    xmin = min(minimum(p -> p[1], outer), minimum(p -> p[1], inner))
+    xmax = max(maximum(p -> p[1], outer), maximum(p -> p[1], inner))
+    ymin = min(minimum(p -> p[2], outer), minimum(p -> p[2], inner))
+    ymax = max(maximum(p -> p[2], outer), maximum(p -> p[2], inner))
+    return (outer, inner, ((xmin, xmax), (ymin, ymax)))
 end
 
 function createArena() :: Arena
@@ -457,30 +491,6 @@ function random_lr(rng)
     # return Float32.(exp(-3.0-Random.rand(rng, Float32)*5.0))
 end
 
-function create_plot(arena)
-    (_, _, bounds) = arena
-    ((xmin, xmax), (ymin, ymax)) = bounds
-    return Plots.plot(
-        xlims=(xmin,xmax),
-        ylims=(ymin,ymax),
-        axis=([],false),
-        grid=false,
-        color=nothing,
-        legend=false,
-    )
-end
-
-function plot_arena!(plt, arena)
-    (polygon, inner, bounds) = arena
-    ((xmin, xmax), (ymin, ymax)) = bounds
-    xs = getindex.(polygon, 1)
-    ys = getindex.(polygon, 2)
-    Plots.plot!(plt, Plots.Shape(xs, ys),color="white")
-    xs = getindex.(inner, 1)
-    ys = getindex.(inner, 2)
-    Plots.plot!(plt, Plots.Shape(xs,ys),color="white")
-end
-
 function car_polygon(b)
     return GLMakie.Polygon([
       GLMakie.Point2f(
@@ -502,36 +512,6 @@ function car_polygon(b)
      ])
 end
 
-function makie_plot_body!(ax, b::Body)
-    points = car_polygon(b)
-    GLMakie.poly!(ax, points ,color="blue",linecolor=nothing)
-end
-
-function plot_body!(plt, b::Body)
-    shape = Plots.Shape(
-                [b.x + 0.05*sin(b.theta),
-                b.x + 0.015*sin(b.theta + tau/3),
-                b.x + 0.015*sin(b.theta - tau/3),
-                b.x + 0.05*sin(b.theta)         ],
-                [ b.y + 0.05*cos(b.theta),
-                 b.y + 0.015*cos(b.theta + tau/3),
-                 b.y + 0.015*cos(b.theta - tau/3),
-                 b.y + 0.05*cos(b.theta)])
-    Plots.plot!(plt,shape,color="blue",linecolor=nothing)
-end
-
-function plot_trail!(plt, trail)
-    for segments in trail
-        befores :: Vector{Body} = getindex.(segments,1)
-        Plots.plot!(plt,map(b -> b.x, befores),map(b -> b.y, befores),linecolor=Colors.RGBA(0,0,0,0.3), linewidth=0.2)
-    end
-end
-
-function plot_sensors!(plt, b::Body, sensorParams)
-    sensors = sensorPoints(b, sensorParams)
-    Plots.scatter!(plt,getindex.(sensors,1), getindex.(sensors,2), markersize=2,linecolor=nothing,color="red")
-end
-
 function traillength(trail)
     return sum([length(t) for t in trail])
 end
@@ -543,40 +523,46 @@ end
 function plot_cars(arena, trails, agents, sensorParams)
     (polygon, inner, bounds) = arena
     (xlims, ylims) = bounds
+    (xmin, xmax) = xlims
+    (ymin, ymax) = ylims
+    width = xmax - xmin + 0.2
+    height = ymax - ymin + 0.2
     fig = GLMakie.Figure(resolution = (1920, 1080))
-    ax = GLMakie.Axis(fig[1, 1])
+    ax = GLMakie.Axis(fig[1, 1], aspect=width/height)
     GLMakie.hidedecorations!(ax)  # hides ticks, grid and lables
     GLMakie.hidespines!(ax)
-    GLMakie.limits!(ax, xlims, ylims)
+    GLMakie.limits!(ax, (xmin - 0.1, xmax + 0.1), (ymin - 0.1, ymax + 0.1))
     makie_bodies = GLMakie.Observable([agent.body for agent in agents])
     makie_cars = GLMakie.lift(xs -> car_polygon.(xs), makie_bodies)
     makie_sensors = GLMakie.Observable(sensorPoints(agents[1].body, sensorParams))
     makie_trails = GLMakie.Observable(trails)
-    makie_trail_segments = GLMakie.Observable(GLMakie.Point2f[])
-    makie_trail_colors = GLMakie.Observable(Bool[])
+    black_segments = GLMakie.Observable(GLMakie.Point2f[])
+    red_segments = GLMakie.Observable(GLMakie.Point2f[])
     function update_trails(ts)
-        makie_trail_segments[]
-        makie_trail_colors[]
-        empty!(makie_trail_segments[])
-        empty!(makie_trail_colors[])
+        empty!(black_segments[])
+        empty!(red_segments[])
         for trail in ts
             for (k,segments) in enumerate(trail)
                 for (before, after) in segments
-                    push!(makie_trail_segments[], GLMakie.Point2f(before.x, before.y))
-                    push!(makie_trail_segments[], GLMakie.Point2f(after.x, after.y))
-                    push!(makie_trail_colors[], k == length(trail))
+                    if k == length(trail)
+                        push!(black_segments[], GLMakie.Point2f(before.x, before.y))
+                        push!(black_segments[], GLMakie.Point2f(after.x, after.y))
+                    else
+                        push!(red_segments[], GLMakie.Point2f(before.x, before.y))
+                        push!(red_segments[], GLMakie.Point2f(after.x, after.y))
+                    end
                 end
             end
         end
-        makie_trail_segments[] = makie_trail_segments[]
-        makie_trail_colors[] = makie_trail_colors[]
+        GLMakie.notify(red_segments)
+        GLMakie.notify(black_segments)
     end
-    colormap = [Colors.RGBA(1.0,0,0,0.2),Colors.RGBA(0,0,0,0.2)]
     GLMakie.on(update_trails, makie_trails)
     update_trails(makie_trails[])
-    GLMakie.poly!(ax,to_poly(polygon);color=:transparent,strokewidth=1,strokecolor=:gray)
-    GLMakie.poly!(ax,to_poly(inner);color=:transparent,strokewidth=1,strokecolor=:gray)
-    GLMakie.linesegments!(ax, makie_trail_segments, color = makie_trail_colors, colormap = colormap)
+    GLMakie.poly!(ax,to_poly(polygon);color=:transparent,strokewidth=5,strokecolor=:gray)
+    GLMakie.poly!(ax,to_poly(inner);color=:transparent,strokewidth=5,strokecolor=:gray)
+    GLMakie.linesegments!(ax, red_segments, strokewidth = 1, color = Colors.RGBA(1.0,0,0,0.1))
+    GLMakie.linesegments!(ax, black_segments, strokewidth = 2, color = Colors.RGBA(0,0,0,0.2))
     GLMakie.poly!(ax, makie_cars,color=GLMakie.Cycled(1))
     GLMakie.scatter!(ax, makie_sensors,color=GLMakie.Cycled(2))
     return (fig, makie_bodies, makie_sensors, makie_trails)
@@ -585,6 +571,7 @@ end
 function cars()
     Base.start_reading(stdin)
     started = time_ns()
+    # arena = createLetterArena()
     arena = createArena()
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
@@ -592,7 +579,7 @@ function cars()
         for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25]
     ]
     motorParams = [-1, -0.5, -0.1, 0, 0.1, 0.5, 1]
-    pop_size = 200
+    pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
     agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
@@ -607,23 +594,26 @@ function cars()
     target_fps = 30
     expectancy = 0.0
     MAX_HISTORY = 100
-    MAX_TRAIL = 40
+    MAX_TRAIL = 60
     empty :: Matrix{Float32} = Float32.([0.0 0.0])
     showwindow = false
     frames = 1:100000
     deathsperframe = 0.0
     halflife = 250.0 # frames
     decay = 1 - 2^(-1/halflife)
+    rundir = string("runs/", Dates.now())
+    mkdir(rundir)
+    mkdir(string(rundir, "/frames"))
     if showwindow
         display(fig)
-        loop = f -> open("mimicry.csv", "w+") do io
+        loop = f -> open(string(rundir,"/mimicry.csv"), "w+") do io
             println(io, "frame,deaths,deaths_per_frame,max_age,mean_age,loss")
             foreach(x -> f(x, io), frames)
         end
     else
-        loop = f -> open("mimicry.csv", "w+") do io
+        loop = f -> open(string(rundir,"/mimicry.csv"), "w+") do io
             println(io, "frame,deaths,deaths_per_frame,max_age,mean_age,loss")
-            GLMakie.record(x -> f(x,io), fig, "animation.mp4", frames; framerate=12, compression=14)
+            GLMakie.record(x -> f(x,io), fig, string(rundir,"/animation.mp4"), frames; framerate=12, compression=20)
         end
     end
     loop() do frame, csv
@@ -720,6 +710,10 @@ function cars()
         makie_sensors[] = sensorPoints(agents[1].body, sensorParams)
         makie_trails[] = copy(trails)
         yield() # TODO: replace with yield() if that works
+        if frame % 100 == 0
+            filename = string(rundir, "/frames/","frame-",frame,".png")
+            GLMakie.save(filename, fig)
+        end
 
         current = time_ns()
         ages = [agent.age for agent in agents]
