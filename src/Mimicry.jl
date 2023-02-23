@@ -653,7 +653,7 @@ function cars()
 
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
         deaths = sum([ a ? 0 : 1 for a in alive])
-        deathsperframe = deathsperframe * decay + deaths * (1 - decay)
+        deathsperframe = deaths * decay  + deathsperframe * (1 - decay)
         if !any(alive)
             for i in 1:length(agents)
                 agents[i].body = randomBody(rng, arena)
@@ -728,6 +728,7 @@ function cars()
         max_age = maximum(ages)
         loss = Lux.mean(losses)
         println(csv, frame, ",", deaths, ",", deathsperframe, ",", max_age, ",", mean_age, ",", loss)
+        flush(csv)
         if current - last_print > 0.05e9
             (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents], ages)
             if to.enabled
