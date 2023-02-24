@@ -235,15 +235,7 @@ function turn(b :: Body, amount)
     )
 end
 
-function createLetterArena() :: Arena
-    vertices = [
-        (0.0, 0.0),
-        (0.0, 2.0),
-        (1.0, 1.5),
-        (2.0, 2.0),
-        (2.0, 0.0),
-        (0.0, 0.0),
-    ]
+function createLetterArena() :: Tuple{Arena, Int64}
     outer :: Polygon  = [
         (-0.2, -0.2),
         (-0.2,  2.2),
@@ -266,10 +258,11 @@ function createLetterArena() :: Arena
     xmax = max(maximum(p -> p[1], outer), maximum(p -> p[1], inner))
     ymin = min(minimum(p -> p[2], outer), minimum(p -> p[2], inner))
     ymax = max(maximum(p -> p[2], outer), maximum(p -> p[2], inner))
-    return (outer, inner, ((xmin, xmax), (ymin, ymax)))
+    arena = (outer, inner, ((xmin, xmax), (ymin, ymax)))
+    return (arena, 60)
 end
 
-function createArena() :: Arena
+function createArena() :: Tuple{Arena, Int64}
     # TODO: compute this
     polygon :: Polygon = [
       (-1.2, 2.0),
@@ -341,7 +334,8 @@ function createArena() :: Arena
     xmax = max(maximum(p -> p[1], polygon), maximum(p -> p[1], inner))
     ymin = min(minimum(p -> p[2], polygon), minimum(p -> p[2], inner))
     ymax = max(maximum(p -> p[2], polygon), maximum(p -> p[2], inner))
-    return (polygon, inner, ((xmin, xmax), (ymin, ymax)))
+    arena = (polygon, inner, ((xmin, xmax), (ymin, ymax)))
+    return arena, 180
 end
 
 function disable_echo()
@@ -571,8 +565,8 @@ end
 function cars()
     Base.start_reading(stdin)
     started = time_ns()
-    # arena = createLetterArena()
-    arena = createArena()
+    # (arena, MAX_TRAIL) = createLetterArena()
+    (arena, MAX_TRAIL) = createArena()
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -594,7 +588,6 @@ function cars()
     target_fps = 30
     expectancy = 0.0
     MAX_HISTORY = 100
-    MAX_TRAIL = 60
     empty :: Matrix{Float32} = Float32.([0.0 0.0])
     showwindow = false
     frames = 1:100000
