@@ -612,7 +612,7 @@ function cars()
     realtime = false
     target_fps = 30
     expectancy = 0.0
-    MAX_HISTORY = 100
+    MAX_HISTORY = 10
     empty :: Matrix{Float32} = Float32.([0.0 0.0])
     showwindow = false
     frames = 1:100000
