@@ -104,24 +104,31 @@ end
 # (means, logvars, new_carry) = model((x,carry), ps, st)
 
 # Run one step through the model
+#function (model::CarModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
+#    (x, x2, (carry,carry2,carry3)) = inputs
+#    z, st_dense = model.dense(x, ps.dense, st.dense)
+#    (y, new_carry), st_lstm = model.lstm_cell((x2, carry), ps.lstm_cell, st.lstm_cell)
+#    (y2, new_carry_2), st_lstm2 = model.lstm_cell2((y, carry2), ps.lstm_cell2, st.lstm_cell2)
+#    (y3, new_carry_3), st_lstm3 = model.lstm_cell3((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
+#    st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3))
+#    mid = z .+ y3
+#    motors, st_motors = model.motors(mid, ps.motors, st.motors)
+#    st = merge(st, (motors=st_motors, dense=st_dense))
+#    return (Lux.logsoftmax(motors), (new_carry, new_carry_2, new_carry_3)), st
+#end
 function (model::CarModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
-    (x, x2, (carry,carry2,carry3)) = inputs
+    x, _, _ = inputs
     z, st_dense = model.dense(x, ps.dense, st.dense)
-    (y, new_carry), st_lstm = model.lstm_cell((x2, carry), ps.lstm_cell, st.lstm_cell)
-    (y2, new_carry_2), st_lstm2 = model.lstm_cell2((y, carry2), ps.lstm_cell2, st.lstm_cell2)
-    (y3, new_carry_3), st_lstm3 = model.lstm_cell3((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
-    st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3))
-    mid = z .+ y3
-    motors, st_motors = model.motors(mid, ps.motors, st.motors)
+    motors, st_motors = model.motors(z, ps.motors, st.motors)
     st = merge(st, (motors=st_motors, dense=st_dense))
-    return (Lux.logsoftmax(motors), (new_carry, new_carry_2, new_carry_3)), st
+    return Lux.logsoftmax(motors), st
 end
 
 function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
     carry = initialcarry
     loss = 0.0
     for (sensors, sensors2, sampled) in sequence
-        (motors, carry), st = model((sensors, sensors2, carry), ps, st)
+        motors, st = model((sensors, sensors2, carry), ps, st)
         if !isfinite(loss)
             println(means, logvars, sampled)
             error("Infinite loss")
@@ -146,10 +153,10 @@ function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry
     grads = back((1.0, nothing))[1]
     a = 0.0f0
     b = 0.0f0
-    for (g, g2, _) in grads.inputs
-        a += sum(g .* g)
-        b += sum(g2 .* g2)
-    end
+    # for (g, g2, _) in grads.inputs
+    #     a += sum(g .* g)
+    #     b += sum(g2 .* g2)
+    # end
     (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads.params)
     agent.optimiser_state = st_opt
     agent.parameters = ps
@@ -423,8 +430,8 @@ end
     sensors = reshape(values,length(values),1)
     original_carry = agent.carry
     inputs = (sensors, sensors, original_carry)
-    (motors, carry), st = agent.model(inputs, agent.parameters, agent.state)
-    agent.carry = carry
+    motors, st = agent.model(inputs, agent.parameters, agent.state)
+    # agent.carry = carry
     agent.state = st
     if !all(map(isfinite, motors))
         println(motors)
