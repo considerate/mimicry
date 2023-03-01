@@ -96,6 +96,7 @@ mutable struct Car
     parameters::NamedTuple
     state::NamedTuple
     optimiser_state :: NamedTuple
+    last_died :: Int64
 end
 
 
@@ -182,7 +183,7 @@ function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
     body = randomBody(rng, arena)
     st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
     carry = newcarry(rng, (a,b,c), batchsize)
-    return Car(0, 0, carry, body, model, ps, st, st_opt)
+    return Car(0, 0, carry, body, model, ps, st, st_opt, -10000)
 end
 
 function logloss(activations :: Matrix{Float32}, sampled::Int) :: Float32
@@ -235,7 +236,7 @@ function turn(b :: Body, amount)
     )
 end
 
-function createLetterArena() :: Tuple{Arena, Int64}
+function createLetterArena() :: Tuple{Arena, Int64, Function, Int64}
     outer :: Polygon  = [
         (-0.2, -0.2),
         (-0.2,  2.2),
@@ -259,10 +260,10 @@ function createLetterArena() :: Tuple{Arena, Int64}
     ymin = min(minimum(p -> p[2], outer), minimum(p -> p[2], inner))
     ymax = max(maximum(p -> p[2], outer), maximum(p -> p[2], inner))
     arena = (outer, inner, ((xmin, xmax), (ymin, ymax)))
-    return (arena, 60)
+    return arena, 60, _ -> 1, 1
 end
 
-function createArena() :: Tuple{Arena, Int64}
+function createArena() :: Tuple{Arena, Int64, Function, Int64}
     # TODO: compute this
     polygon :: Polygon = [
       (-1.2, 2.0),
@@ -335,7 +336,30 @@ function createArena() :: Tuple{Arena, Int64}
     ymin = min(minimum(p -> p[2], polygon), minimum(p -> p[2], inner))
     ymax = max(maximum(p -> p[2], polygon), maximum(p -> p[2], inner))
     arena = (polygon, inner, ((xmin, xmax), (ymin, ymax)))
-    return arena, 180
+    function get_section(body)
+        midy = 1.0
+        x1 = 1.0
+        x2 = 3.0
+        if body.y < midy
+            if body.x < x1
+                return 1
+            elseif body.x < x2
+                return 2
+            else
+                return 3
+            end
+        else
+            if body.x < x1
+                return 4
+            elseif body.x < x2
+                return 5
+            else
+                return 6
+            end
+        end
+
+    end
+    return arena, 180, get_section, 6
 end
 
 function disable_echo()
@@ -565,8 +589,8 @@ end
 function cars()
     Base.start_reading(stdin)
     started = time_ns()
-    # (arena, MAX_TRAIL) = createLetterArena()
-    (arena, MAX_TRAIL) = createArena()
+    # (arena, MAX_TRAIL, section, sections) = createLetterArena()
+    (arena, MAX_TRAIL, section, sections) = createArena()
     sensorParams :: Vector{Polar} = [
         (d, a*tau)
         for d in [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -580,6 +604,7 @@ function cars()
     trails :: Vector{Vector{Vector{Tuple{Body,Body}}}} = [[[]] for _ in 1:pop_size]
     (fig, makie_bodies, makie_sensors, makie_trails) = plot_cars(arena, trails, agents, sensorParams)
     history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Body, Body}}} = [[] for _ in 1:pop_size]
+    last_steps :: Vector{Tuple{Body, Body}} = [(Body(0,0,0), Body(0,0,0)) for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
     tpf = 0.001
@@ -597,18 +622,23 @@ function cars()
     rundir = string("runs/", Dates.now())
     mkdir(rundir)
     mkdir(string(rundir, "/frames"))
+    exitcolumns = join([string("exit_",c) for c in 1:sections], ",")
+    crashcolumns = join([string("crash_",c) for c in 1:sections], ",")
+    columns = string("frame,deaths,deaths_per_frame,max_age,mean_age,loss", ",", exitcolumns, ",", crashcolumns)
     if showwindow
         display(fig)
         loop = f -> open(string(rundir,"/mimicry.csv"), "w+") do io
-            println(io, "frame,deaths,deaths_per_frame,max_age,mean_age,loss")
+            println(io,columns)
             foreach(x -> f(x, io), frames)
         end
     else
         loop = f -> open(string(rundir,"/mimicry.csv"), "w+") do io
-            println(io, "frame,deaths,deaths_per_frame,max_age,mean_age,loss")
+            println(io, columns)
             GLMakie.record(x -> f(x,io), fig, string(rundir,"/animation.mp4"), frames; framerate=12, compression=20)
         end
     end
+    filename = string(rundir, "/frames/","frame-",0,".png")
+    GLMakie.save(filename, fig)
     loop() do frame, csv
         motorss :: Vector{Matrix{Float32}} = [empty for _ in agents]
         Threads.@threads for k in 1:length(agents)
@@ -618,6 +648,7 @@ function cars()
             body = agent.body
             (sensors, carry, motors, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
             motorss[k] = exp.(motors)
+            last_steps[k] = (body, agent.body)
             push!(history[k], ((sensors,sampled), carry, body, agent.body))
             push!(trails[k][end], (body, agent.body))
             if length(history[k]) > MAX_HISTORY
@@ -632,15 +663,30 @@ function cars()
                 end
             end
         end
-        motor = Lux.mean(motorss)
-
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
         deaths = sum([ a ? 0 : 1 for a in alive])
         deathsperframe = deaths * decay  + deathsperframe * (1 - decay)
+        exits = [0 for _ in 1:sections]
+        crashes = [0 for _ in 1:sections]
+        cells = [0 for _ in 1:sections]
+        for (agent, (before,after),survived) in zip(agents,last_steps,alive)
+            cells[section(after)] += 1
+            if agent.last_died < frame - 30
+                if !survived
+                    crashes[section(before)] += 1
+                else
+                    if section(before) != section(after)
+                        exits[section(before)] += 1
+                    end
+                end
+            end
+        end
+
         if !any(alive)
             for i in 1:length(agents)
                 agents[i].body = randomBody(rng, arena)
                 agents[i].age = 0
+                agents[i].last_died = frame
                 history[i] = []
                 trails[i] = [[]]
                 alive[i] = true
@@ -664,20 +710,13 @@ function cars()
                 else
                     expectancy = 0.999 * expectancy + 0.001 * agents[i].age
                 end
-                # agents[i] = deepcopy(agents[neighbour])
                 replicatecar(rng, agents[neighbour], agents[i], arena)
                 agents[i].age = 0
+                agents[i].last_died = frame
                 history[i] = copy(history[neighbour])
                 if length(trails[i][end]) > 0
                     push!(trails[i], [])
                 end
-                #if !new
-                #    parents[i] = neighbour
-                #    history[i] = copy(history[neighbour])
-                #else
-                #    parents[i] = 0
-                #    history[i] = []
-                #end
             end
         end
 
@@ -714,7 +753,14 @@ function cars()
         mean_age = sum(ages) / length(agents)
         max_age = maximum(ages)
         loss = Lux.mean(losses)
-        println(csv, frame, ",", deaths, ",", deathsperframe, ",", max_age, ",", mean_age, ",", loss)
+        line = join([
+                      join([frame, deaths, deathsperframe, max_age, mean_age, loss], ","),
+                      join(exits, ","),
+                      join(crashes, ","),
+                     ],
+                    ","
+        )
+        println(csv, line)
         flush(csv)
         if current - last_print > 0.05e9
             (plt, (_, _)) = draw_scene(arena, [agent.body for agent in agents], ages)
@@ -732,7 +778,7 @@ function cars()
             is_realtime = realtime ? "true" : "false"
             summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy loss
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
-            output = string(chart, "\n", profiling, summary, "\n", motor, "\n", hist, "\n", "\n\n", dense_grads, " : ", lstm_grads, "\n\n")
+            output = string(chart, "\n", profiling, summary, "\n", cells, "\n", hist, "\n", "\n\n", dense_grads, " : ", lstm_grads, "\n\n")
             lines = countlines(IOBuffer(output))
             print(output)
             print("\033[s") # save cursor
