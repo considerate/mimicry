@@ -16,6 +16,7 @@ import ColorSchemes
 import Colors
 import GLMakie
 import Dates
+import NearestNeighbors
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float32}}
@@ -123,13 +124,23 @@ function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vec
     for (sensors, sensors2, sampled) in sequence
         (motors, carry), st = model((sensors, sensors2, carry), ps, st)
         if !isfinite(loss)
-            println(means, logvars, sampled)
             error("Infinite loss")
         end
-        # instead of adding the loss at each step
-        # let's do traditional horizon prediction and only
-        # apply the loss for the predicted values
         loss = loss + logloss(motors, sampled)
+    end
+    return loss, st
+end
+
+function mimic_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
+    carry = initialcarry
+    loss = 0.0
+    for (sensors, target) in sequence
+        (motors, carry), st = model((sensors, sensors, carry), ps, st)
+        if !isfinite(loss)
+            error("Infinite loss")
+        end
+        # cross_entropy = sum(exp.(target) .* motors)
+        loss = loss + logloss(motors, target)
     end
     return loss, st
 end
@@ -155,6 +166,22 @@ function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry
     agent.parameters = ps
     return (loss, sqrt(a), sqrt(b))
 end
+
+function mimic(agent, history :: Vector{Tuple{Matrix{Float32}, Int64}})
+    if length(history) == 0
+        return
+    end
+    original_carry = deepcopy(agent.carry)
+    (loss, st), back = Zygote.pullback(p -> mimic_loss(agent.model, original_carry, history, p, agent.state), agent.parameters)
+    agent.state = st
+    grads = back((1.0, nothing))[1]
+    (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
+    agent.optimiser_state = st_opt
+    agent.parameters = ps
+    agent.carry = original_carry
+    return loss
+end
+
 function newcarry(rng, sizes, batchsize=1) :: Carry
     (a,b,c) = sizes
     return (
@@ -190,8 +217,19 @@ function logloss(activations :: Matrix{Float32}, sampled::Int) :: Float32
     return -activations[sampled, 1]
 end
 
-function sampleDiscrete(rng, activations :: Matrix{Float32})
-    probs = exp.(activations)
+function sampleDiscrete(rng, probs)
+    r = Random.rand(rng)
+    for i in 1:length(probs)
+        r -= probs[i]
+        if r<=0.0
+            return i
+        end
+    end
+    return length(probs)
+end
+
+
+function sampleDiscrete2d(rng, probs)
     r = Random.rand(rng)
     for i in 1:length(probs)
         r -= probs[i, 1]
@@ -404,7 +442,6 @@ end
 function sample(rng, means::Matrix{Float32},logvars::Matrix{Float32})::Tuple{Matrix{Float32}, Matrix{Float32}}
     sigma = exp.(logvars.*Float32(0.5))
     normals = Random.randn(rng, Float32, size(means))
-    # println(uniforms, sigma, means)
     return (normals, normals.*sigma .+ means)
 end
 
@@ -430,7 +467,7 @@ end
         println(motors)
         error("Non-finite motor outputs")
     end
-    sampled = sampleDiscrete(rng, motors)
+    sampled = sampleDiscrete2d(rng, exp.(motors))
     output = motorParams[sampled]
     agent.body = moveForward(rng, turn(agent.body,output))
     return (sensors, original_carry, motors, sampled)
@@ -603,7 +640,7 @@ function cars()
     agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
     trails :: Vector{Vector{Vector{Tuple{Body,Body}}}} = [[[]] for _ in 1:pop_size]
     (fig, makie_bodies, makie_sensors, makie_trails) = plot_cars(arena, trails, agents, sensorParams)
-    history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Body, Body}}} = [[] for _ in 1:pop_size]
+    history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Matrix{Float32}, Body, Body}}} = [[] for _ in 1:pop_size]
     last_steps :: Vector{Tuple{Body, Body}} = [(Body(0,0,0), Body(0,0,0)) for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
@@ -625,16 +662,31 @@ function cars()
     exitcolumns = join([string("exit_",c) for c in 1:sections], ",")
     crashcolumns = join([string("crash_",c) for c in 1:sections], ",")
     columns = string("frame,deaths,deaths_per_frame,max_age,mean_age,loss", ",", exitcolumns, ",", crashcolumns)
+    stop = false
     if showwindow
         display(fig)
         loop = f -> open(string(rundir,"/mimicry.csv"), "w+") do io
             println(io,columns)
-            foreach(x -> f(x, io), frames)
+            for frame in frames
+                if stop
+                    break
+                end
+                f(frame,io)
+            end
         end
     else
         loop = f -> open(string(rundir,"/mimicry.csv"), "w+") do io
             println(io, columns)
-            GLMakie.record(x -> f(x,io), fig, string(rundir,"/animation.mp4"), frames; framerate=12, compression=20)
+            function recorder(rec)
+                for frame in frames
+                    if stop
+                        break
+                    end
+                    f(frame,io)
+                    GLMakie.recordframe!(rec)
+                end
+            end
+            GLMakie.record(recorder, fig, string(rundir,"/animation.mp4"); framerate=12, compression=20)
         end
     end
     filename = string(rundir, "/frames/","frame-",0,".png")
@@ -649,7 +701,7 @@ function cars()
             (sensors, carry, motors, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
             motorss[k] = exp.(motors)
             last_steps[k] = (body, agent.body)
-            push!(history[k], ((sensors,sampled), carry, body, agent.body))
+            push!(history[k], ((sensors,sampled), carry, motors, body, agent.body))
             push!(trails[k][end], (body, agent.body))
             if length(history[k]) > MAX_HISTORY
                 popfirst!(history[k])
@@ -664,6 +716,9 @@ function cars()
             end
         end
         alive = [ontrack((agent.body.x, agent.body.y), arena) for agent in agents]
+        # alive_idx = [i for i in 1:pop_size if alive[i]]
+        # kddata = [if i == 1 agents[k].body.x else agents[k].body.y for k in alive_id for i in 1:2]
+        # tree = NearestNeighbors.KDTree(kddata)
         deaths = sum([ a ? 0 : 1 for a in alive])
         deathsperframe = deaths * decay  + deathsperframe * (1 - decay)
         exits = [0 for _ in 1:sections]
@@ -692,10 +747,16 @@ function cars()
                 alive[i] = true
             end
         end
+        PURE_MIMICRY = true
 
         Threads.@threads for i in 1:length(agents)
             if alive[i]
                 parents[i] = i
+            elseif PURE_MIMICRY
+                agents[i].body = randomBody(rng, arena)
+                agents[i].age = 0
+                agents[i].last_died = frame
+                history[i] = []
             else
                 k = i
                 neighbour = Random.rand(rng, 1:length(agents)) # mod1(k+rand([-1,1]), length(agents))
@@ -723,19 +784,26 @@ function cars()
 
         tasks = []
         losses = [0.0 for _ in agents]
+        ages = [agent.age for agent in agents]
         for k in 1:length(agents)
+            # if (frame + k) % (MAX_HISTORY ÷ 10) == 0
+            #     t = Threads.@spawn begin
+            #         (l, a, b) = train(agents[k], [(values, carry) for (values, carry, _, _, _) in history[k]])
+            #         losses[k] += l
+            #         return (a,b)
+            #     end
+            #     push!(tasks, t)
+            # end
+            probs = ages / sum(ages)
             if (frame + k) % (MAX_HISTORY ÷ 10) == 0
                 t = Threads.@spawn begin
-                    (l, a, b) = train(agents[k], [(values, carry) for (values, carry, _, _) in history[k]])
-                    losses[k] += l
-                    return (a,b)
+                    target = sampleDiscrete(rng, probs) # sample one agent relative to its age
+                    mimic(agents[k], [values for (values, _, _, _, _) in history[target]])
                 end
                 push!(tasks, t)
             end
         end
         results = [fetch(t) for t in tasks]
-        dense_grads = Lux.mean([a for (a,_) in results])
-        lstm_grads = Lux.mean([b for (_,b) in results])
 
         # Update our plot state
         makie_bodies[] = [agent.body for agent in agents]
@@ -748,11 +816,10 @@ function cars()
         end
 
         current = time_ns()
-        ages = [agent.age for agent in agents]
         longest_lineage = maximum([agent.lineage for agent in agents])
         mean_age = sum(ages) / length(agents)
         max_age = maximum(ages)
-        loss = Lux.mean(losses)
+        loss = sum(losses) / length(tasks)
         line = join([
                       join([frame, deaths, deathsperframe, max_age, mean_age, loss], ","),
                       join(exits, ","),
@@ -778,7 +845,7 @@ function cars()
             is_realtime = realtime ? "true" : "false"
             summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy loss
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
-            output = string(chart, "\n", profiling, summary, "\n", cells, "\n", hist, "\n", "\n\n", dense_grads, " : ", lstm_grads, "\n\n")
+            output = string(chart, "\n", profiling, summary, "\n", cells, "\n", hist, "\n", "\n\n", "\n\n")
             lines = countlines(IOBuffer(output))
             print(output)
             print("\033[s") # save cursor
@@ -793,6 +860,8 @@ function cars()
             data = read(stdin, bb)
             if data[1] == UInt(32)
                 realtime = !realtime
+            elseif data[1] == UInt(113)
+                stop = true
             end
         end
         if realtime && current < target_step
@@ -809,7 +878,7 @@ const F_GETFL = Cint(3)
 const F_SETFL = Cint(4)
 const O_NONBLOCK = Cint(0o00004000)
 
-function main()
+function run(game, profile)
     atexit(cleanup)
     s :: RawFD = RawFD(Base.Core.Integer(0))
     flags = ccall(:fcntl, Cint, (RawFD, Cint, Cint...), s, F_GETFL)
@@ -819,11 +888,8 @@ function main()
     ccall(:fcntl, Cint, (RawFD, Cint, Cint...), s, F_SETFL, flags2)
     print("\033[?25l") # hide cursor
     Base.exit_on_sigint(false)
-    game = ARGS[1]
-    if length(ARGS) > 1
-        if ARGS[2] == "profile"
-            TimerOutputs.enable_timer!(to)
-        end
+    if profile
+        TimerOutputs.enable_timer!(to)
     end
     try
         if game == "cars"
@@ -836,7 +902,7 @@ function main()
             cars()
         end
     catch e
-        if isa(e, TaskFailedException)
+        while isa(e, TaskFailedException)
             e = e.task.exception
         end
         if isa(e, Core.InterruptException)
@@ -848,6 +914,20 @@ function main()
         TERMIOS.tcsetattr(stdin, TERMIOS.TCSANOW, backup_termios)
         cleanup()
     end
+end
+
+function main()
+    game = "cars"
+    profile = false
+    if length(ARGS) > 0
+        game = ARGS[1]
+    end
+    if length(ARGS) > 1
+        if ARGS[2] == "profile"
+            profile = true
+        end
+    end
+    run(game, profile)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
