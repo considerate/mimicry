@@ -177,14 +177,13 @@ function mimic(rng, agent, history :: Vector{Tuple{Matrix{Float32}, Int64, Float
     if length(history) == 0
         return
     end
-    original_carry = deepcopy(agent.carry)
+    original_carry = agent.carry
     (loss, st), back = Zygote.pullback(p -> mimic_loss(rng, agent.model, original_carry, history, p, agent.state), agent.parameters)
     agent.state = st
     grads = back((1.0, nothing))[1]
     (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
     agent.optimiser_state = st_opt
     agent.parameters = ps
-    agent.carry = original_carry
     return loss
 end
 
