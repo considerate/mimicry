@@ -804,7 +804,8 @@ function cars()
             if (frame + k) % (MAX_HISTORY ÷ 10) == 0
                 t = Threads.@spawn begin
                     target = sampleDiscrete(rng, probs) # sample one agent relative to its age
-                    mimic(rng, agents[k], [(sensors, sampled, accept) for ((sensors, sampled), _, _, accept, _, _) in history[target]])
+                    l = mimic(rng, agents[k], [(sensors, sampled, accept) for ((sensors, sampled), _, _, accept, _, _) in history[target]])
+                    return l
                 end
                 push!(tasks, t)
             end
@@ -825,7 +826,7 @@ function cars()
         longest_lineage = maximum([agent.lineage for agent in agents])
         mean_age = sum(ages) / length(agents)
         max_age = maximum(ages)
-        loss = sum(losses) / length(tasks)
+        loss = Lux.mean(results)
         line = join([
                       join([frame, deaths, deathsperframe, max_age, mean_age, loss], ","),
                       join(exits, ","),
