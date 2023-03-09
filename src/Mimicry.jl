@@ -77,12 +77,13 @@ struct Body
     theta::Float32
 end
 
-struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :lstm_cell2, :lstm_cell3, :dense, :motors)}
+struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :lstm_cell2, :lstm_cell3, :dense, :motors, :accept)}
     lstm_cell:: Lux.LSTMCell
     lstm_cell2:: Lux.LSTMCell
     lstm_cell3:: Lux.LSTMCell
     dense :: Lux.Dense
     motors :: Lux.Dense
+    accept :: Lux.Dense
 end
 
 
@@ -114,8 +115,9 @@ function (model::CarModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, Carry
     st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3))
     mid = z .+ y3
     motors, st_motors = model.motors(mid, ps.motors, st.motors)
-    st = merge(st, (motors=st_motors, dense=st_dense))
-    return (Lux.logsoftmax(motors), (new_carry, new_carry_2, new_carry_3)), st
+    accept, st_accept = model.accept(mid, ps.accept, st.accept)
+    st = merge(st, (motors=st_motors, dense=st_dense, accept=st_accept))
+    return ((Lux.logsoftmax(motors), accept), (new_carry, new_carry_2, new_carry_3)), st
 end
 
 function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
@@ -131,16 +133,20 @@ function sequence_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vec
     return loss, st
 end
 
-function mimic_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
+function mimic_loss(rng, model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int, Float32}}, ps :: NamedTuple, st :: NamedTuple)
     carry = initialcarry
     loss = 0.0
-    for (sensors, target) in sequence
-        (motors, carry), st = model((sensors, sensors, carry), ps, st)
+    for (sensors, target, their) in sequence
+        ((motors, accept), carry), st = model((sensors, sensors, carry), ps, st)
         if !isfinite(loss)
             error("Infinite loss")
         end
-        # cross_entropy = sum(exp.(target) .* motors)
-        loss = loss + logloss(motors, target)
+        r = Random.rand(rng)
+        mine = accept[1,1]
+        if r < mine
+            loss = loss + logloss(motors, target)
+        end
+        loss = loss + (their - mine)^2
     end
     return loss, st
 end
@@ -167,12 +173,12 @@ function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry
     return (loss, sqrt(a), sqrt(b))
 end
 
-function mimic(agent, history :: Vector{Tuple{Matrix{Float32}, Int64}})
+function mimic(rng, agent, history :: Vector{Tuple{Matrix{Float32}, Int64, Float32}})
     if length(history) == 0
         return
     end
     original_carry = deepcopy(agent.carry)
-    (loss, st), back = Zygote.pullback(p -> mimic_loss(agent.model, original_carry, history, p, agent.state), agent.parameters)
+    (loss, st), back = Zygote.pullback(p -> mimic_loss(rng, agent.model, original_carry, history, p, agent.state), agent.parameters)
     agent.state = st
     grads = back((1.0, nothing))[1]
     (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
@@ -197,14 +203,12 @@ end
 
 function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
     (a,b,c) = (40,30,20)
-    min_var = Float32(0.1)
-    min_logvar = log(min_var)
-    max_logvar = Float32(10)
     model = CarModel(Lux.LSTMCell(sensorSize => a, use_bias=true),
                      Lux.LSTMCell(a => b, use_bias=true),
                      Lux.LSTMCell(b => c, use_bias=true),
                      Lux.Dense(sensorSize => c, Lux.relu, init_weight=scaled_glorot),
                      Lux.Dense(c => motorSize, init_weight=scaled_glorot),
+                     Lux.Dense(c => 1, Lux.sigmoid),
                     )
     (ps, st) = Lux.setup(rng, model)
     body = randomBody(rng, arena)
@@ -460,7 +464,7 @@ end
     sensors = reshape(values,length(values),1)
     original_carry = agent.carry
     inputs = (sensors, sensors, original_carry)
-    (motors, carry), st = agent.model(inputs, agent.parameters, agent.state)
+    ((motors, accept), carry), st = agent.model(inputs, agent.parameters, agent.state)
     agent.carry = carry
     agent.state = st
     if !all(map(isfinite, motors))
@@ -470,7 +474,7 @@ end
     sampled = sampleDiscrete2d(rng, exp.(motors))
     output = motorParams[sampled]
     agent.body = moveForward(rng, turn(agent.body,output))
-    return (sensors, original_carry, motors, sampled)
+    return (sensors, original_carry, motors, accept[1,1], sampled)
 end
 
 
@@ -640,7 +644,8 @@ function cars()
     agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
     trails :: Vector{Vector{Vector{Tuple{Body,Body}}}} = [[[]] for _ in 1:pop_size]
     (fig, makie_bodies, makie_sensors, makie_trails) = plot_cars(arena, trails, agents, sensorParams)
-    history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Matrix{Float32}, Body, Body}}} = [[] for _ in 1:pop_size]
+    history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Matrix{Float32}, Float32, Body, Body}}} = [[] for _ in 1:pop_size]
+    acceptance :: Vector{Float32} = [0f0 for _ in 1:pop_size]
     last_steps :: Vector{Tuple{Body, Body}} = [(Body(0,0,0), Body(0,0,0)) for _ in 1:pop_size]
     prev = time_ns()
     last_print = 0
@@ -698,10 +703,11 @@ function cars()
             agent.age += 1
             agent.lineage += 1
             body = agent.body
-            (sensors, carry, motors, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
+            (sensors, carry, motors, accept, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
+            acceptance[k] = accept
             motorss[k] = exp.(motors)
             last_steps[k] = (body, agent.body)
-            push!(history[k], ((sensors,sampled), carry, motors, body, agent.body))
+            push!(history[k], ((sensors,sampled), carry, motors, accept, body, agent.body))
             push!(trails[k][end], (body, agent.body))
             if length(history[k]) > MAX_HISTORY
                 popfirst!(history[k])
@@ -785,6 +791,7 @@ function cars()
         tasks = []
         losses = [0.0 for _ in agents]
         ages = [agent.age for agent in agents]
+        probs = ages / sum(ages)
         for k in 1:length(agents)
             # if (frame + k) % (MAX_HISTORY ÷ 10) == 0
             #     t = Threads.@spawn begin
@@ -794,11 +801,10 @@ function cars()
             #     end
             #     push!(tasks, t)
             # end
-            probs = ages / sum(ages)
             if (frame + k) % (MAX_HISTORY ÷ 10) == 0
                 t = Threads.@spawn begin
                     target = sampleDiscrete(rng, probs) # sample one agent relative to its age
-                    mimic(agents[k], [values for (values, _, _, _, _) in history[target]])
+                    mimic(rng, agents[k], [(sensors, sampled, accept) for ((sensors, sampled), _, _, accept, _, _) in history[target]])
                 end
                 push!(tasks, t)
             end
@@ -843,7 +849,8 @@ function cars()
             elapsed = current - started
             full_fps = 1/(elapsed/(frame*1e9))
             is_realtime = realtime ? "true" : "false"
-            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_age max_age longest_lineage frame is_realtime expectancy loss
+            mean_accept = Lux.mean(acceptance)
+            summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps mean accept: %1.3f age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_accept mean_age max_age longest_lineage frame is_realtime expectancy loss
             hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
             output = string(chart, "\n", profiling, summary, "\n", cells, "\n", hist, "\n", "\n\n", "\n\n")
             lines = countlines(IOBuffer(output))
