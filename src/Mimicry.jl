@@ -91,6 +91,7 @@ end
 # - what angle to turn using a gaussian
 mutable struct Car
     age :: Int64
+    max_age :: Int64
     lineage :: Int64
     carry :: Carry
     body::Body
@@ -146,7 +147,7 @@ function mimic_loss(rng, model :: CarModel, initialcarry :: Carry, sequence :: V
         if r < mine
             loss = loss + logloss(motors, target)
         end
-        loss = loss + (their - mine)^2
+        # loss = loss + (their - mine)^2
     end
     return loss, st
 end
@@ -174,11 +175,16 @@ function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry
 end
 
 function mimic(rng, agent, history :: Vector{Tuple{Matrix{Float32}, Int64, Float32}})
-    if length(history) == 0
-        return
+    warmup = 10 # warm start the memory with the first 10 steps of history
+    if length(history) <= warmup
+        return 0f0
     end
-    original_carry = agent.carry
-    (loss, st), back = Zygote.pullback(p -> mimic_loss(rng, agent.model, original_carry, history, p, agent.state), agent.parameters)
+    carry = agent.carry
+    for (sensors, _, _) in history[1:warmup]
+        (_, carry), st = agent.model((sensors, sensors, carry), agent.parameters, agent.state)
+        agent.state = st
+    end
+    (loss, st), back = Zygote.pullback(p -> mimic_loss(rng, agent.model, carry, history[warmup+1:end], p, agent.state), agent.parameters)
     agent.state = st
     grads = back((1.0, nothing))[1]
     (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
@@ -194,6 +200,18 @@ function newcarry(rng, sizes, batchsize=1) :: Carry
             (Lux.zeros32(rng, b, batchsize), Lux.zeros32(rng, b, batchsize)),
             (Lux.zeros32(rng, c, batchsize), Lux.zeros32(rng, c, batchsize)),
            )
+end
+
+function zerocarry(carry :: Carry)
+    (a, b, c) = carry
+    function clear(x)
+        (l, r) = x
+        l[:] .= 0f0
+        r[:] .= 0f0
+    end
+    clear(a)
+    clear(b)
+    clear(c)
 end
 
 function scaled_glorot(rng, dims :: Integer...)
@@ -213,7 +231,7 @@ function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
     body = randomBody(rng, arena)
     st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
     carry = newcarry(rng, (a,b,c), batchsize)
-    return Car(0, 0, carry, body, model, ps, st, st_opt, -10000)
+    return Car(0, 0, 0, carry, body, model, ps, st, st_opt, -10000)
 end
 
 function logloss(activations :: Matrix{Float32}, sampled::Int) :: Float32
@@ -262,6 +280,11 @@ function randomBody(rng, arena :: Arena) :: Body
         p = randompoint(rng, bounds)
         if ontrack(p, arena)
             (x,y) = p
+            xdist = min(abs(x), abs(x - 4))
+            ydist = min(abs(y), abs(y - 2))
+            if  min(xdist, ydist) > 0.2
+                continue
+            end
             return Body(x, y, theta)
         end
     end
@@ -701,6 +724,7 @@ function cars()
             agent = agents[k]
             agent.age += 1
             agent.lineage += 1
+            agent.max_age = max(agent.age, agent.max_age)
             body = agent.body
             (sensors, carry, motors, accept, sampled) = updatecar(rng, agent, sensorParams, motorParams, arena)
             acceptance[k] = accept
@@ -759,9 +783,13 @@ function cars()
                 parents[i] = i
             elseif PURE_MIMICRY
                 agents[i].body = randomBody(rng, arena)
+                zerocarry(agents[i].carry) # clear memory
                 agents[i].age = 0
                 agents[i].last_died = frame
                 history[i] = []
+                if length(trails[i][end]) > 0
+                    push!(trails[i], [])
+                end
             else
                 k = i
                 neighbour = Random.rand(rng, 1:length(agents)) # mod1(k+rand([-1,1]), length(agents))
@@ -788,9 +816,17 @@ function cars()
 
 
         tasks = []
-        losses = [0.0 for _ in agents]
         ages = [agent.age for agent in agents]
-        probs = ages / sum(ages)
+        high_scores = [agent.max_age for agent in agents]
+        positions = Matrix{Float32}(undef, 2, length(agents))
+        for (k, agent) in enumerate(agents)
+            positions[1,k] = agent.body.x
+            positions[2,k] = agent.body.y
+        end
+        tree = NearestNeighbors.KDTree(positions)
+        n_neighbours = 8
+        indices, _ = NearestNeighbors.knn(tree, positions, n_neighbours)
+
         for k in 1:length(agents)
             # if (frame + k) % (MAX_HISTORY ÷ 10) == 0
             #     t = Threads.@spawn begin
@@ -802,6 +838,8 @@ function cars()
             # end
             if (frame + k) % (MAX_HISTORY ÷ 10) == 0
                 t = Threads.@spawn begin
+                    scores = [ages[n] for n in indices[k]]
+                    probs = scores / sum(scores)
                     target = sampleDiscrete(rng, probs) # sample one agent relative to its age
                     l = mimic(rng, agents[k], [(sensors, sampled, accept) for ((sensors, sampled), _, _, accept, _, _) in history[target]])
                     return l
@@ -851,7 +889,7 @@ function cars()
             is_realtime = realtime ? "true" : "false"
             mean_accept = Lux.mean(acceptance)
             summary = @sprintf "\033[K%8.1ffps mean: %7.1ffps mean accept: %1.3f age: %6.1f max age: %6d longest lineage: %6d frame: %8d realtime %s life: %6.1f\tloss: %2.3g" (1/(tpf/1.0e9)) full_fps mean_accept mean_age max_age longest_lineage frame is_realtime expectancy loss
-            hist = Base.string(UnicodePlots.histogram(ages, nbins=10, closed=:left, xscale=:log10))
+            hist = Base.string(UnicodePlots.histogram(high_scores, nbins=10, closed=:left, xscale=:log10))
             output = string(chart, "\n", profiling, summary, "\n", cells, "\n", hist, "\n", "\n\n", "\n\n")
             lines = countlines(IOBuffer(output))
             print(output)
