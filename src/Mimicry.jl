@@ -137,7 +137,7 @@ end
 function mimic_loss(rng, model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int, Float32}}, ps :: NamedTuple, st :: NamedTuple)
     carry = initialcarry
     loss = 0.0
-    for (sensors, target, their) in sequence
+    for (sensors, target, _) in sequence
         ((motors, accept), carry), st = model((sensors, sensors, carry), ps, st)
         if !isfinite(loss)
             error("Infinite loss")
@@ -151,6 +151,24 @@ function mimic_loss(rng, model :: CarModel, initialcarry :: Carry, sequence :: V
     end
     return loss, st
 end
+
+function badaction(activations :: Matrix{Float32}, sampled::Int) :: Float32
+    return -log(1 - exp(activations[sampled, 1]))
+end
+
+function remorse_loss(model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{Matrix{Float32}, Int}}, ps :: NamedTuple, st :: NamedTuple)
+    carry = initialcarry
+    loss = 0.0
+    for (sensors, target) in sequence
+        ((motors, _), carry), st = model((sensors, sensors, carry), ps, st)
+        loss = loss + badaction(motors, target)
+        if !isfinite(loss)
+            error("Infinite loss")
+        end
+    end
+    return loss, st
+end
+
 
 function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry}})
     if length(history) == 0
@@ -172,6 +190,16 @@ function train(agent, history :: Vector{Tuple{Tuple{Matrix{Float32}, Int}, Carry
     agent.optimiser_state = st_opt
     agent.parameters = ps
     return (loss, sqrt(a), sqrt(b))
+end
+
+function remorse(agent, carry :: Carry, history :: Vector{Tuple{Matrix{Float32}, Int64}})
+    (loss, st), back = Zygote.pullback(p -> remorse_loss(agent.model, carry, history, p, agent.state), agent.parameters)
+    agent.state = st
+    grads = back((1.0, nothing))[1]
+    (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
+    agent.optimiser_state = st_opt
+    agent.parameters = ps
+    return loss
 end
 
 function mimic(rng, agent, history :: Vector{Tuple{Matrix{Float32}, Int64, Float32}})
@@ -730,7 +758,7 @@ function cars()
             acceptance[k] = accept
             motorss[k] = exp.(motors)
             last_steps[k] = (body, agent.body)
-            push!(history[k], ((sensors,sampled), carry, motors, accept, body, agent.body))
+            push!(history[k], ((sensors,sampled), deepcopy(carry), motors, accept, body, agent.body))
             push!(trails[k][end], (body, agent.body))
             if length(history[k]) > MAX_HISTORY
                 popfirst!(history[k])
@@ -782,6 +810,10 @@ function cars()
             if alive[i]
                 parents[i] = i
             elseif PURE_MIMICRY
+                if length(history[i]) > 0
+                    carry = history[i][1][2]
+                    remorse(agents[i], carry, [(sensors, sampled) for ((sensors,sampled), _, _, _, _, _) in history[i]])
+                end
                 agents[i].body = randomBody(rng, arena)
                 zerocarry(agents[i].carry) # clear memory
                 agents[i].age = 0
