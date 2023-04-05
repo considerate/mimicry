@@ -18,6 +18,7 @@ import GLMakie
 import Dates
 import NearestNeighbors
 import CUDA
+import StatsBase
 
 const tau=2*pi
 const Polygon = Vector{StaticArrays.SVector{2, Float32}}
@@ -29,7 +30,7 @@ const Arena = Tuple{Polygon, Polygon, Bounds}
 const Prob = Tuple{Vector{Float32}, Vector{Float32}}
 const Sensors = Matrix{Float32}
 const CuMatrix32 = CUDA.CuMatrix{Float32}
-const Carry = Tuple{Tuple{CuMatrix32, CuMatrix32},Tuple{CuMatrix32, CuMatrix32},Tuple{CuMatrix32, CuMatrix32}}
+const LSTMState = Tuple{Tuple{CuMatrix32, CuMatrix32},Tuple{CuMatrix32, CuMatrix32},Tuple{CuMatrix32, CuMatrix32}}
 const Sampled = Int
 const Parent = Int64
 
@@ -80,82 +81,54 @@ struct Body
     theta::Float32
 end
 
-struct CarModel <: Lux.AbstractExplicitContainerLayer{(:lstm_cell, :lstm_cell2, :lstm_cell3, :dense, :motors, :accept)}
-    lstm_cell:: Lux.LSTMCell
-    lstm_cell2:: Lux.LSTMCell
-    lstm_cell3:: Lux.LSTMCell
-    dense :: Lux.Dense
+# x, s |-> x, a
+struct AgentModel <: Lux.AbstractExplicitContainerLayer{(:sensor_lstm, :buffer_lstm, :combined_lstm, :buffer, :motors)}
+    sensor_lstm :: Lux.LSTMCell
+    buffer_lstm :: Lux.LSTMCell
+    combined_lstm :: Lux.LSTMCell
+    buffer :: Lux.Dense
     motors :: Lux.Dense
-    accept :: Lux.Dense
 end
 
 
-# A Car decides:
+# A Agent decides:
 # - what angle to turn using a gaussian
-mutable struct Car
-    age :: Int64
-    max_age :: Int64
-    lineage :: Int64
-    carry :: Carry
-    body::Body
-    model::CarModel
+struct AgentParams
+    model::AgentModel
     parameters::NamedTuple
     state::NamedTuple
-    optimiser_state :: NamedTuple
-    last_died :: Int64
 end
 
+struct Team
+    model
+    agents :: Vector{Agent}
+    buffer :: CUDA.Vector{Float32}
+    parameters :: NamedTuple
+    state :: NamedTuple
+    # left-team has direction 1.0, right-team has direction -1.0
+    direction :: Float32
+end
 
-# model = CarModel(Lux.LSTMCell(...), Lux.Dense(..), Lux.Dense(..))
-# (means, logvars, new_carry) = model((x,carry), ps, st)
+mutable struct Agent
+    body :: Body
+    carry :: LSTMState
+end
 
 # Run one step through the model
-function (model::CarModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, Carry}, ps :: NamedTuple, st :: NamedTuple)
-    (x, x2, (carry,carry2,carry3)) = inputs
-    z, st_dense = model.dense(x, ps.dense, st.dense)
-    (y, new_carry), st_lstm = model.lstm_cell((x2, carry), ps.lstm_cell, st.lstm_cell)
-    (y2, new_carry_2), st_lstm2 = model.lstm_cell2((y, carry2), ps.lstm_cell2, st.lstm_cell2)
-    (y3, new_carry_3), st_lstm3 = model.lstm_cell3((y2, carry3), ps.lstm_cell3, st.lstm_cell3)
-    st = merge(st, (lstm_cell=st_lstm, lstm_cell2=st_lstm2, lstm_cell3=st_lstm3))
-    mid = z .+ y3
-    motors, st_motors = model.motors(mid, ps.motors, st.motors)
-    accept, st_accept = model.accept(mid, ps.accept, st.accept)
-    st = merge(st, (motors=st_motors, dense=st_dense, accept=st_accept))
-    return ((Lux.logsoftmax(motors), accept), (new_carry, new_carry_2, new_carry_3)), st
+function (model::AgentModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, LSTMState}, ps :: NamedTuple, st :: NamedTuple)
+    (sensors, buffer, (sensor_carry,buffer_carry,combined_carry)) = inputs
+    (sensor_lstm_out, sensor_carry2), st_sensor_lstm = model.sensor_lstm((sensors, sensor_carry), ps.sensor_lstm, st.sensor_lstm)
+    (buffer_lstm_out, buffer_carry2), st_buffer_lstm = model.buffer_lstm((buffers, buffer_carry), ps.buffer_lstm, st.buffer_lstm)
+    combined = sensor_lstm_out .+ buffer_lstm_out
+    (combined_lstm_out, combined_carry2), st_combined_lstm = model.combined_lstm((combined, combined_carry), ps.combined_lstm, st.combined_lstm)
+    motors, st_motors = model.motors(combined_lstm_out, ps.motors, st.motors)
+    buffer, st_buffer = model.motors(combined_lstm_out, ps.buffer, st.buffer)
+    # TODO: update st
+    return ((Lux.logsoftmax(motors), bufffer), (sensor_carry2, buffer_carry2, combined_carry2)), st
 end
 
-function mimic_loss(_, model :: CarModel, initialcarry :: Carry, sequence :: Vector{Tuple{CuMatrix32, Int64}}, ps :: NamedTuple, st :: NamedTuple)
-    carry = initialcarry
-    loss = 0.0
-    for (sensors, target) in sequence
-        ((motors, _), carry), st = model((sensors, sensors, carry), ps, st)
-        loss = loss + logloss(motors, target)
-    end
-    return loss, st
-end
 
-function mimic(rng, agent, history :: Vector{Tuple{Matrix{Float32}, Int64, Float32}})
-    warmup = 10 # warm start the memory with the first 10 steps of history
-    if length(history) <= warmup
-        return 0f0
-    end
-    carry = agent.carry
-    for (sensors, _, _) in history[1:warmup]
-        sensors = sensors |> Lux.gpu
-        (_, carry), st = agent.model((sensors, sensors, carry), agent.parameters, agent.state)
-        agent.state = st
-    end
-    train_history :: Vector{Tuple{CuMatrix32, Int64}} = [ (sensors |> Lux.gpu, target) for (sensors, target) in history[warmup+1:end]]
-    (loss, st), back = Zygote.pullback(p -> mimic_loss(rng, agent.model, carry, train_history, p, agent.state), agent.parameters)
-    agent.state = st
-    grads = back((1.0, nothing))[1]
-    (st_opt, ps) = Optimisers.update!(agent.optimiser_state, agent.parameters, grads)
-    agent.optimiser_state = st_opt
-    agent.parameters = ps
-    return loss
-end
-
-function newcarry(rng, sizes, batchsize=1) :: Carry
+function newcarry(rng, sizes, batchsize=1) :: LSTMState
     (a,b,c) = sizes
     return (
             (Lux.zeros32(rng, a, batchsize), Lux.zeros32(rng, a, batchsize)) .|> Lux.gpu,
@@ -164,7 +137,7 @@ function newcarry(rng, sizes, batchsize=1) :: Carry
            )
 end
 
-function zerocarry(carry :: Carry)
+function zerocarry(carry :: LSTMState)
     (a, b, c) = carry
     function clear(x)
         (l, r) = x
@@ -177,23 +150,21 @@ function zerocarry(carry :: Carry)
 end
 
 function scaled_glorot(rng, dims :: Integer...)
-    return Lux.glorot_uniform(rng, dims...; gain=0.5f0) |> Lux.gpu
+    return Lux.glorot_uniform(rng, dims...; gain=0.5f0)
 end
 
-function Car(rng, learning_rate, sensorSize, motorSize, arena, batchsize=1)
-    (a,b,c) = (40,30,20)
-    model = CarModel(Lux.LSTMCell(sensorSize => a, use_bias=true),
+function AgentParams(rng, sensorSize, motorSize, bufferSize)
+    (a,b) = (40,20)
+    model = AgentModel(
+                     Lux.LSTMCell(sensorSize => a, use_bias=true),
+                     Lux.LSTMCell(bufferSize => a, use_bias=true),
                      Lux.LSTMCell(a => b, use_bias=true),
-                     Lux.LSTMCell(b => c, use_bias=true),
-                     Lux.Dense(sensorSize => c, Lux.relu, init_weight=scaled_glorot),
-                     Lux.Dense(c => motorSize, init_weight=scaled_glorot),
-                     Lux.Dense(c => 1, Lux.sigmoid),
+                     Lux.Dense(b => motorSize, init_weight=scaled_glorot),
+                     Lux.Dense(b => bufferSize),
                     )
-    (ps, st) = Lux.setup(rng, model) |> Lux.gpu
-    body = randomBody(rng, arena)
-    st_opt = Optimisers.setup(Optimisers.Descent(learning_rate), ps)
-    carry = newcarry(rng, (a,b,c), batchsize) .|> Lux.gpu
-    return Car(0, 0, 0, carry, body, model, ps, st, st_opt, -10000)
+    (ps, st) = Lux.setup(rng, model)
+    carry = newcarry(rng, (a,a,c), batchsize)
+    return AgentParams(model, ps, st, carry)
 end
 
 function logloss(activations :: CuMatrix32, sampled::Int) :: Float32
@@ -443,7 +414,7 @@ function moveForward(rng :: Random.AbstractRNG, b::Body)
     )
 end
 
-@timeit to "update car" function updatecar(rng, agent::Car, sensorParams, motorParams, arena :: Arena)
+@timeit to "update car" function updatecar(rng, agent::Agent, sensorParams, motorParams, arena :: Arena)
     values = sensorValues(agent.body, sensorParams, arena)
     sensors = reshape(values,length(values),1)
     carry = agent.carry
@@ -468,7 +439,7 @@ end
 end
 
 
-function replicatecarry(source :: Carry, target :: Carry)
+function replicatecarry(source :: LSTMState, target :: LSTMState)
     function replicateone(a, b)
         (s_memory, s_hidden_state) = a
         (t_memory, t_hidden_state) = b
@@ -480,10 +451,10 @@ function replicatecarry(source :: Carry, target :: Carry)
     end
 end
 
-@timeit to "replicate car" function replicatecar(rng, source :: Car, target :: Car, arena :: Arena)
+@timeit to "replicate car" function replicatecar(rng, source :: Agent, target :: Agent, arena :: Arena)
     if Random.rand(rng) < 0.0
         input_dims = target.model.lstm_cell.in_dims
-        car = Car(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), input_dims, arena)
+        car = Agent(rng, Float32.(exp(-2.0-Random.rand(rng, Float32)*5.0)), input_dims, arena)
         replicatecar(rng, car, target, arena)
         return true
     else
@@ -617,6 +588,65 @@ function plot_cars(arena, trails, agents, sensorParams)
     return (fig, makie_bodies, makie_sensors, makie_trails)
 end
 
+function merge_team_outputs(outputs...)
+    final_buffer = nothing
+    all_motors = [motors for (motors, _) in outputs]
+    for (_, buffer) in outputs
+        if final_buffer === nothing
+            final_buffer = buffer
+        else
+            final_buffer .+= buffer
+        end
+    end
+    return all_motors, final_buffer
+end
+
+function groupmodel(agents :: Vector{Agent})
+    agent_models = [agent.model for agent in agents]
+    team_model = Lux.Parallel(merge_team_outputs , agent_models)
+    return team_model
+end
+
+function sample_team(rng, agentparamss :: Vector{AgentParams}, team_size :: Int64, bufferSize :: Int64, team_direction :: Float32, width, height) :: Team
+    team_members = StatsBase.sample(rng, agentparamss, team_size, replace=false)
+    theta = (1-team_direction)*pi*0.5
+    buffer = Lux.zeros32(rng, (bufferSize,)) |> Lux.gpu
+    agents = [Agent(Body(0.5 * width * team_direction, height * ((i-0.5)/team_size-0.5)*2.0, theta), lstm_state) for i in 1:team_size]
+    team_model = groupmodel(team_members)
+    team_params, team_state = Lux.setup(rng, team_model) |> Lux.gpu
+    team = Team(team_model, agents, buffer, team_params, team_state, team_direction)
+    return team
+end
+
+function rugby()
+    sensorParams :: Vector{Polar} = [
+        (d, a*tau)
+        for d in [0.1, 0.2, 0.3, 0.4, 0.5]
+        for a in [0.25,0.15,0.05,-0.05,-0.15,-0.25]
+    ]
+    turnParams = [-1, -0.5, -0.1, 0, 0.1, 0.5, 1]
+    speedParams = [0, 0.1, 0.5, 1]
+    pop_size = 500
+    rng = Random.default_rng()
+    Random.seed!(rng, 0)
+    bufferSize = 1024
+    agentparamss = [AgentParams(rng, length(sensorParams), length(turnParams), length(speedParams), bufferSize) for _ in 1:pop_size]
+    team_size = 50
+    width, height = 16.0, 9.0
+    team_a = sample_team(rng, agentparamss, team_size, bufferSize, 1.0, width, height)
+    team_b = sample_team(rng, agentparamss, team_size, bufferSize, -1.0, width, height)
+    frames = 1:10000
+    for frame in frames
+        sensors_a = [rugby_sensors(agent, team_a.agents, team_b.agents, team_a.direction) for agent in team_a.agents]
+        sensors_b = [rugby_sensors(agent, team_b.agents, team_a.agents, team_b.direction) for agent in team_a.agents]
+        turns_a, speeds_a, buffer_a = team_a.model([(sensors, team_a.buffer, agent.carry) for (sensors, agent) in zip(sensors_a, team_a.agents)])
+        turn_actions_a = sample_actions(turns_a)
+        speed_actions_a = sample_actions(speeds_a)
+        motors_b, buffer_b = team_b.model([(sensors, team_b.buffer, agent.carry) for (sensors, agent) in zip(sensors_b, team_b.agents)])
+        actions_b = sample_actions(motors_b)
+    end
+end
+
 function cars()
     Base.start_reading(stdin)
     started = time_ns()
@@ -631,7 +661,11 @@ function cars()
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    agents = [Car(rng, random_lr(rng), length(sensorParams), length(motorParams), arena) for _ in 1:pop_size]
+    bufferSize = 1024
+    agents = [Agent(rng, random_lr(rng), length(sensorParams), length(motorParams), bufferSize, arena) for _ in 1:pop_size]
+    team_size = 50
+    team_a, team_a_ps, team_a_st = sample_team(rng, agents, team_size)
+    team_b, team_b_ps, team_b_st = sample_team(rng, agents, team_size)
     trails :: Vector{Vector{Vector{Tuple{Body,Body}}}} = [[[]] for _ in 1:pop_size]
     (fig, makie_bodies, makie_sensors, makie_trails) = plot_cars(arena, trails, agents, sensorParams)
     history :: Vector{Vector{Tuple{Tuple{Sensors,Sampled},Carry, Matrix{Float32}, Float32, Body, Body}}} = [[] for _ in 1:pop_size]
