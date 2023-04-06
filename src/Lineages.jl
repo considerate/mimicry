@@ -82,12 +82,13 @@ struct Body
 end
 
 # x, s |-> x, a
-struct AgentModel <: Lux.AbstractExplicitContainerLayer{(:sensor_lstm, :buffer_lstm, :combined_lstm, :buffer, :motors)}
+struct AgentModel <: Lux.AbstractExplicitContainerLayer{(:sensor_lstm, :buffer_lstm, :combined_lstm, :turn, :speed, :buffer)}
     sensor_lstm :: Lux.LSTMCell
     buffer_lstm :: Lux.LSTMCell
     combined_lstm :: Lux.LSTMCell
+    turn :: Lux.Dense
+    speed :: Lux.Dense
     buffer :: Lux.Dense
-    motors :: Lux.Dense
 end
 
 
@@ -99,32 +100,36 @@ struct AgentParams
     state::NamedTuple
 end
 
-struct Team
-    model
-    agents :: Vector{Agent}
-    buffer :: CUDA.Vector{Float32}
-    parameters :: NamedTuple
-    state :: NamedTuple
-    # left-team has direction 1.0, right-team has direction -1.0
-    direction :: Float32
-end
-
+# TODO: separate game-state and neural network parts
 mutable struct Agent
     body :: Body
     carry :: LSTMState
 end
 
+struct Team
+    model
+    agents :: Vector{Agent}
+    buffer :: CuMatrix32
+    parameters :: NamedTuple
+    state :: NamedTuple
+    optimiser_state :: NamedTuple
+    # left-team has direction 1.0, right-team has direction -1.0
+    direction :: Float32
+end
+
+
 # Run one step through the model
 function (model::AgentModel)(inputs :: Tuple{AbstractMatrix, AbstractMatrix, LSTMState}, ps :: NamedTuple, st :: NamedTuple)
     (sensors, buffer, (sensor_carry,buffer_carry,combined_carry)) = inputs
     (sensor_lstm_out, sensor_carry2), st_sensor_lstm = model.sensor_lstm((sensors, sensor_carry), ps.sensor_lstm, st.sensor_lstm)
-    (buffer_lstm_out, buffer_carry2), st_buffer_lstm = model.buffer_lstm((buffers, buffer_carry), ps.buffer_lstm, st.buffer_lstm)
+    (buffer_lstm_out, buffer_carry2), st_buffer_lstm = model.buffer_lstm((buffer, buffer_carry), ps.buffer_lstm, st.buffer_lstm)
     combined = sensor_lstm_out .+ buffer_lstm_out
     (combined_lstm_out, combined_carry2), st_combined_lstm = model.combined_lstm((combined, combined_carry), ps.combined_lstm, st.combined_lstm)
-    motors, st_motors = model.motors(combined_lstm_out, ps.motors, st.motors)
-    buffer, st_buffer = model.motors(combined_lstm_out, ps.buffer, st.buffer)
+    turn, st_turn = model.turn(combined_lstm_out, ps.turn, st.turn)
+    speed, st_speed = model.speed(combined_lstm_out, ps.speed, st.speed)
+    buffer, st_buffer = model.buffer(combined_lstm_out, ps.buffer, st.buffer)
     # TODO: update st
-    return ((Lux.logsoftmax(motors), bufffer), (sensor_carry2, buffer_carry2, combined_carry2)), st
+    return ((Lux.logsoftmax(turn), Lux.logsoftmax(speed), buffer), (sensor_carry2, buffer_carry2, combined_carry2)), st
 end
 
 
@@ -153,18 +158,18 @@ function scaled_glorot(rng, dims :: Integer...)
     return Lux.glorot_uniform(rng, dims...; gain=0.5f0)
 end
 
-function AgentParams(rng, sensorSize, motorSize, bufferSize)
+function AgentParams(rng, sensorSize, turnSize, speedSize, bufferSize)
     (a,b) = (40,20)
     model = AgentModel(
                      Lux.LSTMCell(sensorSize => a, use_bias=true),
                      Lux.LSTMCell(bufferSize => a, use_bias=true),
                      Lux.LSTMCell(a => b, use_bias=true),
-                     Lux.Dense(b => motorSize, init_weight=scaled_glorot),
+                     Lux.Dense(b => turnSize, init_weight=scaled_glorot),
+                     Lux.Dense(b => speedSize, init_weight=scaled_glorot),
                      Lux.Dense(b => bufferSize),
                     )
     (ps, st) = Lux.setup(rng, model)
-    carry = newcarry(rng, (a,a,c), batchsize)
-    return AgentParams(model, ps, st, carry)
+    return AgentParams(model, ps, st)
 end
 
 function logloss(activations :: CuMatrix32, sampled::Int) :: Float32
@@ -414,30 +419,6 @@ function moveForward(rng :: Random.AbstractRNG, b::Body)
     )
 end
 
-@timeit to "update car" function updatecar(rng, agent::Agent, sensorParams, motorParams, arena :: Arena)
-    values = sensorValues(agent.body, sensorParams, arena)
-    sensors = reshape(values,length(values),1)
-    carry = agent.carry
-    original_carry = carry
-    sensors = sensors |> Lux.gpu
-    st = agent.state
-    inputs = (sensors, sensors, original_carry)
-    ((motors, accept), carry), st = agent.model(inputs, agent.parameters, agent.state)
-    ms = motors |> Lux.cpu
-    acc = (accept |> Lux.cpu)[1,1]
-    acc = 1f0
-    agent.carry = carry
-    agent.state = st
-    if !all(map(isfinite, ms))
-        println(ms)
-        error("Non-finite motor outputs")
-    end
-    sampled = sampleDiscrete2d(rng, exp.(ms))
-    output = motorParams[sampled]
-    agent.body = moveForward(rng, turn(agent.body,output))
-    return (sensors, original_carry, ms, acc, sampled)
-end
-
 
 function replicatecarry(source :: LSTMState, target :: LSTMState)
     function replicateone(a, b)
@@ -589,33 +570,43 @@ function plot_cars(arena, trails, agents, sensorParams)
 end
 
 function merge_team_outputs(outputs...)
-    final_buffer = nothing
-    all_motors = [motors for (motors, _) in outputs]
-    for (_, buffer) in outputs
-        if final_buffer === nothing
-            final_buffer = buffer
-        else
-            final_buffer .+= buffer
-        end
-    end
-    return all_motors, final_buffer
+    all_turns = [turn for ((turn, _, _), _) in outputs]
+    all_speeds = [speed for ((_, speed, _), _) in outputs]
+    final_buffer = Lux.sum([buffer for ((_,_,buffer), _) in outputs])
+    return all_turns, all_speeds, final_buffer
 end
 
-function groupmodel(agents :: Vector{Agent})
+function groupmodel(agents :: Vector{AgentParams})
     agent_models = [agent.model for agent in agents]
-    team_model = Lux.Parallel(merge_team_outputs , agent_models)
+    #agent_models = NamedTupleTools.namedtuple([i => agent.model for (i,agent) in enumerate(agents)])
+    team_model = Lux.Parallel(merge_team_outputs, agent_models...)
     return team_model
 end
 
-function sample_team(rng, agentparamss :: Vector{AgentParams}, team_size :: Int64, bufferSize :: Int64, team_direction :: Float32, width, height) :: Team
+function sample_team(rng, agentparamss :: Vector{AgentParams}, team_size :: Int64, bufferSize :: Int64, team_direction :: Float64, width, height) :: Team
     team_members = StatsBase.sample(rng, agentparamss, team_size, replace=false)
     theta = (1-team_direction)*pi*0.5
-    buffer = Lux.zeros32(rng, (bufferSize,)) |> Lux.gpu
+    lstm_state = newcarry(rng, (40,40,20), 1)
+    buffer :: CuMatrix32 = Lux.zeros32(rng, (bufferSize,1)) |> Lux.gpu
     agents = [Agent(Body(0.5 * width * team_direction, height * ((i-0.5)/team_size-0.5)*2.0, theta), lstm_state) for i in 1:team_size]
     team_model = groupmodel(team_members)
     team_params, team_state = Lux.setup(rng, team_model) |> Lux.gpu
-    team = Team(team_model, agents, buffer, team_params, team_state, team_direction)
+    optim = Optimisers.Descent(0.001)
+    team_optimiser = Optimisers.setup(optim, team_params)
+    team = Team(team_model, agents, buffer, team_params, team_state, team_optimiser, team_direction)
     return team
+end
+
+function rugby_loss(model, inputs, ps, st)
+    outputs, st = model(inputs, ps, st)
+    # TODO: actually compute the lineage-learning thing here
+    loss = Lux.sum([turn.^2 for ((turn,_,_),_) in outputs])
+    loss += Lux.sum([speed.^2 for ((_,speed,_),_) in outputs])
+    return loss, st
+end
+
+function rugby_sensors(rng, agent, same_team, other_team, direction, sensorParams) :: CuMatrix32
+    Lux.zeros32(rng, (length(sensorParams),1)) |> Lux.gpu
 end
 
 function rugby()
@@ -629,7 +620,7 @@ function rugby()
     pop_size = 500
     rng = Random.default_rng()
     Random.seed!(rng, 0)
-    bufferSize = 1024
+    bufferSize = 10
     agentparamss = [AgentParams(rng, length(sensorParams), length(turnParams), length(speedParams), bufferSize) for _ in 1:pop_size]
     team_size = 50
     width, height = 16.0, 9.0
@@ -637,13 +628,21 @@ function rugby()
     team_b = sample_team(rng, agentparamss, team_size, bufferSize, -1.0, width, height)
     frames = 1:10000
     for frame in frames
-        sensors_a = [rugby_sensors(agent, team_a.agents, team_b.agents, team_a.direction) for agent in team_a.agents]
-        sensors_b = [rugby_sensors(agent, team_b.agents, team_a.agents, team_b.direction) for agent in team_a.agents]
-        turns_a, speeds_a, buffer_a = team_a.model([(sensors, team_a.buffer, agent.carry) for (sensors, agent) in zip(sensors_a, team_a.agents)])
-        turn_actions_a = sample_actions(turns_a)
-        speed_actions_a = sample_actions(speeds_a)
-        motors_b, buffer_b = team_b.model([(sensors, team_b.buffer, agent.carry) for (sensors, agent) in zip(sensors_b, team_b.agents)])
-        actions_b = sample_actions(motors_b)
+        println("frame: ",frame)
+        sensors_a = [rugby_sensors(rng, agent, team_a.agents, team_b.agents, team_a.direction, sensorParams) for agent in team_a.agents]
+        sensors_b = [rugby_sensors(rng, agent, team_b.agents, team_a.agents, team_b.direction, sensorParams) for agent in team_a.agents]
+        inputs_a = Tuple((sensors, team_a.buffer, agent.carry) for (sensors, agent) in zip(sensors_a, team_a.agents))
+        (loss_a, _), back = Zygote.pullback(p -> rugby_loss(team_a.model, inputs_a, p, team_a.state), team_a.parameters)
+        grads = back((1.0, nothing))[1]
+        println(loss_a)
+        opt_state, ps = Optimisers.update(team_a.optimiser_state, team_a.params, grads)
+        team_a.optimiser_state = opt_state
+        team_a.parameters = ps
+        #(turns_a, speeds_a, buffer_a), st_team_a =
+        # turn_actions_a = sample_actions(turns_a)
+        # speed_actions_a = sample_actions(speeds_a)
+        # motors_b, buffer_b = team_b.model([(sensors, team_b.buffer, agent.carry) for (sensors, agent) in zip(sensors_b, team_b.agents)], team_b.parameters, team_b.state)
+        # actions_b = sample_actions(motors_b)
     end
 end
 
@@ -966,17 +965,7 @@ function run(game, profile)
 end
 
 function main()
-    game = "cars"
-    profile = false
-    if length(ARGS) > 0
-        game = ARGS[1]
-    end
-    if length(ARGS) > 1
-        if ARGS[2] == "profile"
-            profile = true
-        end
-    end
-    run(game, profile)
+    rugby()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
