@@ -106,7 +106,7 @@ mutable struct Agent
     carry :: LSTMState
 end
 
-struct Team
+mutable struct Team
     model
     agents :: Vector{Agent}
     buffer :: CuMatrix32
@@ -578,7 +578,6 @@ end
 
 function groupmodel(agents :: Vector{AgentParams})
     agent_models = [agent.model for agent in agents]
-    #agent_models = NamedTupleTools.namedtuple([i => agent.model for (i,agent) in enumerate(agents)])
     team_model = Lux.Parallel(merge_team_outputs, agent_models...)
     return team_model
 end
@@ -598,10 +597,10 @@ function sample_team(rng, agentparamss :: Vector{AgentParams}, team_size :: Int6
 end
 
 function rugby_loss(model, inputs, ps, st)
-    outputs, st = model(inputs, ps, st)
+    (turns, speeds, buffer), st = model(inputs, ps, st)
     # TODO: actually compute the lineage-learning thing here
-    loss = Lux.sum([turn.^2 for ((turn,_,_),_) in outputs])
-    loss += Lux.sum([speed.^2 for ((_,speed,_),_) in outputs])
+    loss = Lux.sum([Lux.sum(turn.^2) for turn in turns])
+    loss += Lux.sum([Lux.sum(speed.^2) for speed in speeds])
     return loss, st
 end
 
@@ -622,7 +621,7 @@ function rugby()
     Random.seed!(rng, 0)
     bufferSize = 10
     agentparamss = [AgentParams(rng, length(sensorParams), length(turnParams), length(speedParams), bufferSize) for _ in 1:pop_size]
-    team_size = 50
+    team_size = 10
     width, height = 16.0, 9.0
     team_a = sample_team(rng, agentparamss, team_size, bufferSize, 1.0, width, height)
     team_b = sample_team(rng, agentparamss, team_size, bufferSize, -1.0, width, height)
@@ -635,7 +634,7 @@ function rugby()
         (loss_a, _), back = Zygote.pullback(p -> rugby_loss(team_a.model, inputs_a, p, team_a.state), team_a.parameters)
         grads = back((1.0, nothing))[1]
         println(loss_a)
-        opt_state, ps = Optimisers.update(team_a.optimiser_state, team_a.params, grads)
+        opt_state, ps = Optimisers.update(team_a.optimiser_state, team_a.parameters, grads)
         team_a.optimiser_state = opt_state
         team_a.parameters = ps
         #(turns_a, speeds_a, buffer_a), st_team_a =
