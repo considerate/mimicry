@@ -3,9 +3,8 @@
 
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
-    # flake-utils.inputs.nixpkgs.follows = "nixpkgs";
     nixgl.url = "github:guibou/nixGL";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-22.11";
+    nixpkgs.url = "github:NixOS/nixpkgs";
   };
 
   outputs =
@@ -92,7 +91,17 @@
             #  export LD_LIBRARY_PATH="$(nixGLNvidia printenv LD_LIBRARY_PATH):$LD_LIBRARY_PATH"
             #'';
           });
-          devShells.default = pkgs.stdenv.mkDerivation {
+          devShells.default =
+            let
+              poetry-env = pkgs.poetry2nix.mkPoetryEnv {
+                projectDir = ./.;
+                overrides = pkgs.poetry2nix.overrides.withDefaults (pyfinal: pyprev: {
+                  torch = pyfinal.torch-bin;
+                });
+              };
+            in
+            poetry-env.env;
+          devShells.julia = pkgs.stdenv.mkDerivation {
             name = "julia-shell";
             LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib:/run/opengl-driver/lib:${pkgs.lib.strings.makeLibraryPath (targets pkgs)}";
             buildInputs = [
