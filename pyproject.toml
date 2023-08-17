@@ -10,6 +10,7 @@ readme = "README.md"
 python = "^3.10"
 numpy = "^1.25.2"
 torch = "^2.0.1"
+pyglet = "^2.0.9"
 
 
 [build-system]
