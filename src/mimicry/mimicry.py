@@ -162,7 +162,34 @@ def on_track(floor: Iterable[shapes.ShapeBase]):
         return False
     return check
 
+def car_sensors(car: Car, sensor_field: Iterable[tuple[float, float]]) -> list[Location]:
+    x, y = car.location
+    return [
+        Location(
+            x + d * cos(angle + car.angle),
+            y + d * sin(angle + car.angle),
+        )
+        for (d, angle) in sensor_field
+    ]
+
+def draw_sensors(
+    sensors: Iterable[Location],
+    batch: shapes.Batch,
+    radius: float = 0.01
+) -> list[shapes.Circle]:
+    blue = (50, 100, 255, 255)
+    group = pyglet.graphics.Group(order=3)
+    return [
+        shapes.Circle(sensor.x, sensor.y, radius, batch=batch, color=blue, group=group)
+        for sensor in sensors
+    ]
+
 def main():
+    sensor_field = [
+        (d, a*tau)
+        for d in (0.1, 0.2, 0.3, 0.4 ,0.5)
+        for a in (0.25, 0.15, 0.05, -0.05, -0.15, -0.25)
+    ]
     window = pyglet.window.Window(1920, 1080, resizable=True)
     background = pyglet.graphics.Batch()
     bounds, floor = car_track_triangles(background)
@@ -173,14 +200,17 @@ def main():
         random_car(rng, bounds, alive)
         for _ in range(population)
     ]
+    batch = pyglet.graphics.Batch()
+    sensors = pyglet.graphics.Batch()
     @window.event
     def on_draw():
         window.clear()
-        batch = pyglet.graphics.Batch()
         with scale_camera(window, bounds):
             background.draw()
             _ = draw_cars(cars, batch)
             batch.draw()
+            _ = draw_sensors(car_sensors(cars[0], sensor_field), sensors)
+            sensors.draw()
     running = True
     @window.event
     def on_close():
