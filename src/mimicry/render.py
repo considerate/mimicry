@@ -8,7 +8,7 @@ from pyglet import shapes
 from pyglet.window import Window
 from pyglet.math import Vec3
 
-from mimicry.data import Bounds, Car, Location
+from mimicry.data import Bounds, Car, Location, State
 
 
 def draw_sensors(
@@ -128,12 +128,6 @@ def scale_camera(window: Window, bounds: Bounds):
         yield
     finally:
         window.view = original_matrix
-
-@dataclass
-class State:
-    cars: list[Car]
-    sensors: list[Location]
-
 
 def drawer(
     window: pyglet.window.Window,

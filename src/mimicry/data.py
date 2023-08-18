@@ -23,3 +23,8 @@ Polygon = list[Location]
 class Car:
     location: Location
     angle: float
+
+@dataclass
+class State:
+    cars: list[Car]
+    sensors: list[Location]
