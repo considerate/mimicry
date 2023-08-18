@@ -11,6 +11,7 @@ python = "^3.10"
 numpy = "^1.25.2"
 torch = "^2.0.1"
 pyglet = "^2.0.9"
+ffmpeg-python = "^0.2.0"
 
 [tool.poetry.scripts]
 cars = "mimicry.mimicry:main"

@@ -49,6 +49,7 @@
               pkgs.pyright
               poetry-env.pkgs.ruff-lsp
               pkgs.ruff
+              pkgs.ffmpeg-full
             ];
           });
       });

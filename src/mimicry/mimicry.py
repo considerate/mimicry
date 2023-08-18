@@ -1,14 +1,30 @@
 from collections.abc import Callable, Iterable, Sequence
+
+# The pyglet.options line needs to be directly after the import hence the weird
+# placement
 import pyglet
+pyglet.options["headless"] = True
+
 import numpy as np
 import numpy.typing as npt
 from math import tau
+import ffmpeg
+from pathlib import Path
 import torch
+from datetime import datetime
 
 from mimicry.render import car_track_triangles, drawer
-from mimicry.car import car_sensors, on_track, random_car, replicate_car, step_car
+from mimicry.car import (
+    car_sensor_values,
+    car_sensors,
+    on_track,
+    random_car,
+    replicate_car,
+    step_car
+)
 from mimicry.data import Bounds, Location, Polar, State
 from mimicry.network import Agent, create_agent
+
 
 
 def update(
@@ -21,10 +37,15 @@ def update(
     state: State,
     device: torch.device,
 ):
+    sensor_values = [
+        car_sensor_values(car, sensor_field, on_track, device)
+        for car in state.cars
+    ]
     # move cars forward
     for i, car in enumerate(state.cars):
         agent = agents[i]
-        step_car(rng, car, agent, sensor_field, on_track, motor_values, device)
+        values = sensor_values[i]
+        step_car(rng, car, agent, values, motor_values)
     alives = [ on_track(car.location) for car in state.cars ]
 
     # if all cars are dead, create new random ones
@@ -52,7 +73,8 @@ def main():
         for a in (0.25, 0.15, 0.05, -0.05, -0.15, -0.25)
     ]
     motor_values = np.array([-1, -0.5, -0.1, 0, 0.1, 0.5, 1])
-    window = pyglet.window.Window(1920, 1080, resizable=True)
+    width, height = 1920, 1080
+    window = pyglet.window.Window(width, height, resizable=True)
     background = pyglet.graphics.Batch()
     bounds, floor = car_track_triangles(background)
     alive = on_track(floor)
@@ -76,25 +98,55 @@ def main():
         nonlocal running
         running = False
     i = 0
-    while running:
-        i += 1
-        pyglet.clock.tick()
-        update(
-            rng,
-            alive,
-            bounds,
-            sensor_field,
-            motor_values,
-            agents,
-            state,
-            device,
-        )
+    bufman = pyglet.image.get_buffer_manager()
+    now = datetime.now().strftime('%Y-%m-%dT%H%m%S')
+    renders = Path('renders')
+    renders.mkdir(exist_ok=True)
+    output_path = renders / f'render-{now}.mkv'
+    writer = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}')
+        .output(output_path.as_posix(), pix_fmt='yuv420p')
+        .run_async(pipe_stdin=True, quiet=True)
+    )
+    try:
+        while running:
+            print('frame', i)
+            i += 1
+            pyglet.clock.tick()
+            update(
+                rng,
+                alive,
+                bounds,
+                sensor_field,
+                motor_values,
+                agents,
+                state,
+                device,
+            )
 
-        for win in pyglet.app.windows:
-            win.switch_to()
-            win.dispatch_events()
-            win.dispatch_event('on_draw')
-            win.flip()
+            for win in pyglet.app.windows:
+                win.switch_to()
+                win.dispatch_events()
+                win.dispatch_event('on_draw')
+                win.flip()
+            depth_buffer = bufman.get_color_buffer()
+            image_data = depth_buffer.get_image_data()
+            buffer = image_data.get_data(image_data.format, image_data.pitch)
+            frame = np.asarray(buffer).reshape((
+                image_data.height,
+                image_data.width,
+                len(image_data.format),
+            ))
+            # drop alpha channel
+            frame = frame[:,:,:3]
+            # flip image
+            frame = np.flipud(frame)
+            writer.stdin.write(frame.tobytes())
+    except Exception as e:
+        print(e)
+    finally:
+        writer.stdin.close()
 
 if __name__ == '__main__':
     main()
