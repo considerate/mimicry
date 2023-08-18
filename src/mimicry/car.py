@@ -3,7 +3,7 @@ from pyglet import shapes
 import numpy as np
 from math import sin, cos, tau
 
-from mimicry.data import Bounds, Location, Car
+from mimicry.data import Bounds, Location, Car, Polar
 
 def random_car(
     rng: np.random.Generator,
@@ -28,7 +28,7 @@ def on_track(floor: Iterable[shapes.ShapeBase]):
 
 def car_sensors(
     car: Car,
-    sensor_field: Iterable[tuple[float, float]],
+    sensor_field: Iterable[Polar],
 ) -> list[Location]:
     x, y = car.location
     return [
@@ -38,3 +38,7 @@ def car_sensors(
         )
         for (d, angle) in sensor_field
     ]
+
+def replicate_car(source: Car, target: Car):
+    target.location = source.location
+    target.angle = source.angle

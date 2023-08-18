@@ -13,6 +13,10 @@ class Location(NamedTuple):
     x: float
     y: float
 
+class Polar(NamedTuple):
+    magnitude: float
+    angle: float
+
 Polygon = list[Location]
 
 @dataclass
