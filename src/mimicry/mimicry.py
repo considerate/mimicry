@@ -148,7 +148,12 @@ def random_car(
     on_track: Callable[[Location], bool],
 ) -> Car:
     angle = rng.random() * tau
-    return Car(Location(0.0, 0.0), angle)
+    while True:
+        x = bounds.xmin + rng.random() * (bounds.xmax - bounds.xmin)
+        y = bounds.ymin + rng.random() * (bounds.ymax - bounds.ymin)
+        location = Location(x, y)
+        if on_track(location):
+            return Car(location, angle)
 
 def on_track(floor: Iterable[shapes.ShapeBase]):
     def check(location: Location) -> bool:
