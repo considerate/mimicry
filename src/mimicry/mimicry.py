@@ -4,7 +4,6 @@ from typing import NamedTuple
 import pyglet
 from pyglet import shapes
 from dataclasses import dataclass
-import time
 import numpy as np
 from math import sin, cos, tau
 from pyglet.math import Vec3
@@ -210,7 +209,6 @@ def main():
             win.dispatch_events()
             win.dispatch_event('on_draw')
             win.flip()
-        time.sleep(0.01)
 
 if __name__ == '__main__':
     main()
