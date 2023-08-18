@@ -76,10 +76,12 @@ def step_car(
     values = sensor_values(sensors, inside, device)
     motors, carries = agent.model(values, agent.carries)
     agent.carries = carries
-    motor_probs = torch.exp(motors).cpu().numpy()
+    motor_probs = torch.exp(motors).cpu().detach().numpy()
     sampled = rng.choice(np.arange(len(motor_probs)), size=1, p=motor_probs)
     motor = float(motor_values[sampled])
-    return move(turn(car, motor))
+    updated = move(turn(car, motor))
+    car.location = updated.location
+    car.angle = updated.angle
 
 def turn(car: Car, turn: float, turn_rate = tau/40) -> Car:
     angle = (car.angle + turn*turn_rate) % tau

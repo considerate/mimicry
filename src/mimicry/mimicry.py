@@ -75,7 +75,9 @@ def main():
     def on_close():
         nonlocal running
         running = False
+    i = 0
     while running:
+        i += 1
         pyglet.clock.tick()
         update(
             rng,

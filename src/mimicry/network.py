@@ -3,7 +3,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-Carries = tuple[Tensor, Tensor, Tensor]
+Carry = tuple[Tensor, Tensor]
+Carries = tuple[Carry, Carry, Carry]
 
 class Network(torch.nn.Module):
     def __init__(
@@ -24,13 +25,13 @@ class Network(torch.nn.Module):
     def forward(self, x: Tensor, carries: Carries) -> tuple[Tensor, Carries]:
         carry, carry_2, carry_3 = carries
         y, new_carry = self.lstm_cell(x, carry)
-        y_2, new_carry_2 = self.lstm_cell(y, carry_2)
-        y_3, new_carry_3 = self.lstm_cell(y_2, carry_3)
+        y_2, new_carry_2 = self.lstm_cell_2(y, carry_2)
+        y_3, new_carry_3 = self.lstm_cell_3(y_2, carry_3)
         z = self.dense(x)
         mid = z + y_3
         motors = self.motors(mid)
         motor_preds = torch.nn.functional.log_softmax(motors)
-        return motor_preds, (new_carry, new_carry_2, new_carry_3)
+        return motor_preds, ((y, new_carry), (y_2, new_carry_2), (y_3, new_carry_3))
 
 def sequence_loss(
     model: torch.nn.Module,
@@ -52,9 +53,9 @@ class Agent:
 
 def create_agent(n_sensors, n_motors, lstm_1, lstm_2, lstm_3, device) -> Agent:
     model = Network(n_sensors, n_motors, lstm_1, lstm_2, lstm_3).to(device)
-    carry = torch.zeros(lstm_1, device=device)
-    carry_2 = torch.zeros(lstm_2, device=device)
-    carry_3 = torch.zeros(lstm_3, device=device)
+    carry = torch.zeros(lstm_1, device=device), torch.zeros(lstm_1, device=device)
+    carry_2 = torch.zeros(lstm_2, device=device), torch.zeros(lstm_2, device=device)
+    carry_3 = torch.zeros(lstm_3, device=device), torch.zeros(lstm_3, device=device)
     carries = carry, carry_2, carry_3
     return Agent(
         carries,
