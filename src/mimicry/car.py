@@ -63,25 +63,33 @@ def replicate_car(source: Car, target: Car):
     target.location = source.location
     target.angle = source.angle
 
+def car_sensor_values(
+    car: Car,
+    sensor_field: Iterable[Polar],
+    inside: Callable[[Location], bool],
+    device: torch.device,
+) -> Tensor:
+    sensors = car_sensors(car, sensor_field)
+    return sensor_values(sensors, inside, device)
+
 def step_car(
     rng: np.random.Generator,
     car: Car,
     agent: Agent,
-    sensor_field: Iterable[Polar],
-    inside: Callable[[Location], bool],
+    values: Tensor,
     motor_values: npt.NDArray[np.float32],
-    device: torch.device,
 ):
-    sensors = car_sensors(car, sensor_field)
-    values = sensor_values(sensors, inside, device)
-    motors, carries = agent.model(values, agent.carries)
-    agent.carries = carries
-    motor_probs = torch.exp(motors).cpu().detach().numpy()
-    sampled = rng.choice(np.arange(len(motor_probs)), size=1, p=motor_probs)
-    motor = float(motor_values[sampled])
-    updated = move(turn(car, motor))
-    car.location = updated.location
-    car.angle = updated.angle
+    with torch.no_grad():
+        motors, carries = agent.model(values, agent.carries)
+        agent.carries = carries
+        motor_probs = torch.exp(motors).cpu().detach().numpy()
+        indices = np.arange(len(motor_probs))
+        sampled: int = rng.choice(indices, size=1, p=motor_probs).item()
+        motor = float(motor_values[sampled])
+        updated = move(turn(car, motor))
+        car.location = updated.location
+        car.angle = updated.angle
+        return (motor_probs, sampled)
 
 def turn(car: Car, turn: float, turn_rate = tau/40) -> Car:
     angle = (car.angle + turn*turn_rate) % tau

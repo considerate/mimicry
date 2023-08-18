@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 import torch
 from torch import Tensor
@@ -50,6 +50,20 @@ def sequence_loss(
 class Agent:
     carries: Carries
     model: Network
+    optimiser: torch.optim.Optimizer
+
+def train(
+    agent: Agent,
+    history: Sequence[tuple[Tensor, int, Carries]],
+) -> float:
+    if len(history) == 0:
+        return 0.0
+    _, _, carries = history[0]
+    sequence = ( (sensors, sampled) for (sensors, sampled, _) in history )
+    agent.optimiser.zero_grad()
+    loss = sequence_loss(agent.model, carries, sequence)
+    agent.optimiser.step()
+    return loss.item()
 
 def create_agent(n_sensors, n_motors, lstm_1, lstm_2, lstm_3, device) -> Agent:
     model = Network(n_sensors, n_motors, lstm_1, lstm_2, lstm_3).to(device)
@@ -57,7 +71,9 @@ def create_agent(n_sensors, n_motors, lstm_1, lstm_2, lstm_3, device) -> Agent:
     carry_2 = torch.zeros(lstm_2, device=device), torch.zeros(lstm_2, device=device)
     carry_3 = torch.zeros(lstm_3, device=device), torch.zeros(lstm_3, device=device)
     carries = carry, carry_2, carry_3
+    optimiser = torch.optim.AdamW(model.parameters())
     return Agent(
         carries,
         model,
+        optimiser,
     )

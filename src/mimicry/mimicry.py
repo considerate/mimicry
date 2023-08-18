@@ -23,11 +23,12 @@ from mimicry.car import (
     step_car
 )
 from mimicry.data import Bounds, Location, Polar, State
-from mimicry.network import Agent, create_agent
+from mimicry.network import Agent, Carries, create_agent, train
 
 
 
 def update(
+    frame: int,
     rng: np.random.Generator,
     on_track: Callable[[Location], bool],
     bounds: Bounds,
@@ -36,6 +37,8 @@ def update(
     agents: Sequence[Agent],
     state: State,
     device: torch.device,
+    history: list[list[tuple[torch.Tensor, int, Carries]]],
+    max_history: int = 100,
 ):
     sensor_values = [
         car_sensor_values(car, sensor_field, on_track, device)
@@ -45,15 +48,27 @@ def update(
     for i, car in enumerate(state.cars):
         agent = agents[i]
         values = sensor_values[i]
-        step_car(rng, car, agent, values, motor_values)
+        carries = agent.carries
+        _, sampled = step_car(rng, car, agent, values, motor_values)
+        history[i].append((values, sampled, carries))
+        while len(history[i]) > max_history:
+            history[i].pop(0)
     alives = [ on_track(car.location) for car in state.cars ]
+
+    for i, car in enumerate(state.cars):
+        if not alives[i]:
+            continue
+        if (frame + i) % (max_history // 10) == 0:
+            print('training agent', i)
+            train(agents[i], history[i])
 
     # if all cars are dead, create new random ones
     if all([not alive for alive in alives]):
-        for car in state.cars:
+        for i, car in enumerate(state.cars):
             new_car = random_car(rng, bounds, on_track)
             car.location = new_car.location
             car.angle = new_car.angle
+            history[i] = []
     else:
         # replace dead cars with alive ones
         n_cars = len(alives)
@@ -62,6 +77,7 @@ def update(
             while not alives[k]:
                 k = (k - 1) % n_cars if rng.random() < 0.5 else (k + 1) % n_cars
             replicate_car(state.cars[k], car)
+            history[i] = history[k]
     state.sensors = car_sensors(state.cars[0], sensor_field)
 
 def main():
@@ -83,6 +99,7 @@ def main():
         random_car(rng, bounds, alive)
         for _ in range(population)
     ]
+    history = [[] for _ in cars]
     n_sensors = len(sensor_field)
     n_motors = len(motor_values)
     agents = [
@@ -115,6 +132,7 @@ def main():
             i += 1
             pyglet.clock.tick()
             update(
+                i,
                 rng,
                 alive,
                 bounds,
@@ -123,6 +141,7 @@ def main():
                 agents,
                 state,
                 device,
+                history,
             )
 
             for win in pyglet.app.windows:
