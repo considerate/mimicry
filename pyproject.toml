@@ -12,6 +12,8 @@ numpy = "^1.25.2"
 torch = "^2.0.1"
 pyglet = "^2.0.9"
 
+[tool.poetry.scripts]
+cars = "mimicry.mimicry:main"
 
 [build-system]
 requires = ["poetry-core"]
