@@ -7,6 +7,7 @@ from copy import deepcopy
 from math import tau
 import ffmpeg
 from pathlib import Path
+from pyglet.window import Window
 import torch
 from datetime import datetime
 
@@ -160,7 +161,8 @@ def main(headless: bool = False):
                 device,
             )
 
-            for win in pyglet.app.windows:
+            windows: Iterable[Window] = pyglet.app.windows
+            for win in windows:
                 win.switch_to()
                 win.dispatch_events()
                 win.dispatch_event('on_draw')

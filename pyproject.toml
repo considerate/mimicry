@@ -7,11 +7,15 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.12"
 numpy = "^1.25.2"
 torch = "^2.0.1"
 pyglet = "^2.0.9"
 ffmpeg-python = "^0.2.0"
+stable-baselines3 = {version = "^2.1.0", extras = ["extra"]}
+matplotlib = "^3.7.2"
+pyqt6 = "^6.5.2"
+
 
 [tool.poetry.scripts]
 cars = "mimicry.mimicry:main"

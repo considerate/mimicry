@@ -18,7 +18,14 @@ def draw_sensors(
     orange = (255, 180, 10, 255)
     group = pyglet.graphics.Group(order=3)
     return [
-        shapes.Circle(sensor.x, sensor.y, radius, batch=batch, color=orange, group=group)
+        shapes.Circle(
+            sensor.x,
+            sensor.y,
+            radius,
+            batch=batch,
+            color=orange,
+            group=group,
+        )
         for sensor in sensors
     ]
 
