@@ -3,8 +3,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-Carry = tuple[Tensor, Tensor]
-Carries = tuple[Carry, Carry, Carry]
+from mimicry.data import Carries
+
 
 class Network(torch.nn.Module):
     def __init__(
@@ -71,7 +71,8 @@ def create_agent(n_sensors, n_motors, lstm_1, lstm_2, lstm_3, device) -> Agent:
     carry_2 = torch.zeros(lstm_2, device=device), torch.zeros(lstm_2, device=device)
     carry_3 = torch.zeros(lstm_3, device=device), torch.zeros(lstm_3, device=device)
     carries = carry, carry_2, carry_3
-    optimiser = torch.optim.AdamW(model.parameters())
+    #torch.optim.AdamW(model.parameters(), lr=0.01)
+    optimiser = torch.optim.SGD(model.parameters(), lr=0.01)
     return Agent(
         carries,
         model,

@@ -91,7 +91,7 @@ def step_car(
         car.angle = updated.angle
         return (motor_probs, sampled)
 
-def turn(car: Car, turn: float, turn_rate = tau/40) -> Car:
+def turn(car: Car, turn: float, turn_rate = tau/20.0) -> Car:
     angle = (car.angle + turn*turn_rate) % tau
     return replace(car, angle=angle)
 

@@ -1,6 +1,5 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
 from math import cos, sin, tau
 
 import pyglet
@@ -16,14 +15,15 @@ def draw_sensors(
     batch: shapes.Batch,
     radius: float = 0.01
 ) -> list[shapes.Circle]:
-    blue = (50, 100, 255, 255)
+    orange = (255, 180, 10, 255)
     group = pyglet.graphics.Group(order=3)
     return [
-        shapes.Circle(sensor.x, sensor.y, radius, batch=batch, color=blue, group=group)
+        shapes.Circle(sensor.x, sensor.y, radius, batch=batch, color=orange, group=group)
         for sensor in sensors
     ]
 
 def draw_car(car: Car, batch: shapes.Batch) -> shapes.Triangle:
+    blue=(20,20,255,int(255*0.8))
     size = 0.02
     return shapes.Triangle(
         car.location.x + 4.0*size*cos(car.angle),
@@ -32,9 +32,48 @@ def draw_car(car: Car, batch: shapes.Batch) -> shapes.Triangle:
         car.location.y + size*sin(car.angle + tau/3.0),
         car.location.x + size*cos(car.angle - tau/3.0),
         car.location.y + size*sin(car.angle - tau/3.0),
-        color=(255,0,0,255),
         batch=batch,
+        color=blue,
     )
+
+def draw_trail(
+    locations: Sequence[Location],
+    batch: shapes.Batch,
+    group: shapes.Group,
+    color: tuple[int,int,int,int]
+) -> list[shapes.Line]:
+    lines = []
+    n = len(locations)
+    for before, after in zip(locations[:n-1], locations[1:], strict=True):
+        line = shapes.Line(
+            before.x,
+            before.y,
+            after.x,
+            after.y,
+            width=0.005, # type: ignore
+            color=color,
+            batch=batch,
+            group=group,
+        )
+        lines.append(line)
+    return lines
+
+def draw_trails(
+    trails: Iterable[Sequence[Sequence[Location]]],
+    batch: shapes.Batch,
+) -> list[shapes.Line]:
+    red = (255,20,20,int(0.4*255))
+    black = (0,0,0,int(0.4*255))
+    lines = []
+    for trail in trails:
+        for section in trail[:-1]:
+            group = shapes.Group(order=1)
+            for line in draw_trail(section, batch, group, color=red):
+                lines.append(line)
+        group = shapes.Group(order=2)
+        for line in draw_trail(trail[-1], batch, group, color=black):
+            lines.append(line)
+    return lines
 
 def draw_cars(
     cars: Iterable[Car],
@@ -136,12 +175,15 @@ def drawer(
     background: shapes.Batch,
 ):
     batch = pyglet.graphics.Batch()
+    trail_batch = pyglet.graphics.Batch()
     sensors = pyglet.graphics.Batch()
     @window.event
     def on_draw():
         window.clear()
         with scale_camera(window, bounds):
             background.draw()
+            _ = draw_trails(state.trails, trail_batch)
+            trail_batch.draw()
             _ = draw_cars(state.cars, batch)
             batch.draw()
             _ = draw_sensors(state.sensors, sensors)

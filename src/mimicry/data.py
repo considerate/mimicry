@@ -1,6 +1,8 @@
 from typing import NamedTuple
 from dataclasses import dataclass
 
+from torch import Tensor
+
 
 @dataclass
 class Bounds:
@@ -24,7 +26,12 @@ class Car:
     location: Location
     angle: float
 
+Carry = tuple[Tensor, Tensor]
+Carries = tuple[Carry, Carry, Carry]
+
 @dataclass
 class State:
     cars: list[Car]
     sensors: list[Location]
+    history: list[list[tuple[Tensor, int, Carries]]]
+    trails: list[list[list[Location]]]
