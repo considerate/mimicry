@@ -15,6 +15,7 @@ ffmpeg-python = "^0.2.0"
 
 [tool.poetry.scripts]
 cars = "mimicry.mimicry:main"
+headless-cars = "mimicry.headless:main"
 
 [build-system]
 requires = ["poetry-core"]
