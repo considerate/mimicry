@@ -25,7 +25,7 @@ class SparseCartPole(CartPoleEnv):
 
 def reinforcement_learning():
     model = A2C("MlpPolicy", SparseCartPole("rgb_array"), verbose=1)
-    # model.learn(total_timesteps=10_000)
+    model.learn(total_timesteps=10_000)
     vec_env = model.get_env()
     assert vec_env is not None
     observation = vec_env.reset()
@@ -35,11 +35,28 @@ def reinforcement_learning():
     assert isinstance(fig, plt.Figure)
     image = plt.imshow(frame)
     plt.show(block=False)
+    now = datetime.now().strftime('%Y-%m-%dT%H%m%S')
+    renders = Path('renders')
+    renders.mkdir(exist_ok=True)
+    output_path = renders / f'a2c-{now}.mkv'
+    width, height = 600, 400
+    writer = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}')
+        .output(output_path.as_posix(), pix_fmt='yuv420p')
+        .run_async(pipe_stdin=True)
+    )
     for _ in range(1000):
         # agent policy that uses the observation and info
         action, _state = model.predict(observation, deterministic=True) # type: ignore
-        observation, _reward, _terminated, _info = vec_env.step(action)
+        observation, _reward, terminated, _info = vec_env.step(action)
         frame = vec_env.render("rgb_array")
+        assert isinstance(frame, np.ndarray)
+        if terminated:
+            ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
+            red = np.array([255,0,0],dtype=np.uint8)
+            frame[ys,xs,:] = frame[ys,xs,:] * 0.8 + red * 0.2
+        writer.stdin.write(frame.tobytes())
         image.set_data(frame)
         fig.canvas.draw()
         fig.canvas.flush_events()
