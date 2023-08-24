@@ -70,12 +70,12 @@ def sample_agent(rng: np.random.Generator, sensors: Tensor, agent: Agent) -> int
     motors, carries = agent.model(sensors, agent.carries)
     agent.carries = carries
     motor_probs = torch.exp(motors).cpu().detach().numpy()
-    action = rng.integers(0, len(motor_probs))
-    return action
+    action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)
+    return action[0]
 
 def random_walks():
     rng = np.random.default_rng()
-    envs = [SparseCartPole("rgb_array") for _ in range(150)]
+    envs = [SparseCartPole("rgb_array") for _ in range(10)]
     history: list[list[tuple[Observation, int, Carries]]] = [[] for _ in envs]
     n_sensors = 4
     n_motors = 2
