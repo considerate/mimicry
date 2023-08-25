@@ -37,7 +37,7 @@ class Network(torch.nn.Module):
 def sequence_loss(
     model: torch.nn.Module,
     initialcarry: Carries,
-    sequence: Iterable[tuple[Tensor, int]],
+    sequence: Sequence[tuple[Tensor, int]],
 ):
     loss = torch.scalar_tensor(0.0, requires_grad=True)
     carry = initialcarry
@@ -60,9 +60,10 @@ def train(
     if len(history) == 0:
         return 0.0
     _, _, carries = history[0]
-    sequence = ( (sensors, sampled) for (sensors, sampled, _) in history )
+    sequence = [ (sensors, sampled) for (sensors, sampled, _) in history ]
     agent.optimiser.zero_grad()
     loss = sequence_loss(agent.model, carries, sequence)
+    loss.backward()
     agent.optimiser.step()
     return loss.item()
 

@@ -25,9 +25,10 @@ from mimicry.network import Agent, create_agent, train
 
 
 
-def replicate_params(source: dict[str, Any] | Any, target: dict[str, Any] | Any):
-    if not isinstance(source, dict):
+def replicate_params(source: dict[str, Any] | float, target: dict[str, Any] | float):
+    if isinstance(source, float):
         return source
+    assert not isinstance(target, float)
     for key, v in source.items():
         if isinstance(v, torch.Tensor):
             t = target[key]
@@ -56,7 +57,7 @@ def update(
     agents: Sequence[Agent],
     state: State,
     device: torch.device,
-    max_history: int = 100,
+    max_history: int = 20,
 ):
     sensor_values = [
         car_sensor_values(car, sensor_field, on_track, device)
@@ -136,7 +137,7 @@ def main(headless: bool = False):
     background = pyglet.graphics.Batch()
     bounds, floor = car_track_triangles(background)
     alive = on_track(floor)
-    population = 150
+    population = 50
     cars = [
         random_car(rng, bounds, alive)
         for _ in range(population)
@@ -146,7 +147,7 @@ def main(headless: bool = False):
     n_sensors = len(sensor_field)
     n_motors = len(motor_values)
     agents = [
-        create_agent(n_sensors, n_motors, 40, 30, 20, device)
+        create_agent(n_sensors, n_motors, 10, 10, 10, device)
         for _ in cars
     ]
     car = cars[0]

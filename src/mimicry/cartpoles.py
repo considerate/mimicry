@@ -11,9 +11,10 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from torch import Tensor
-import time
+import argparse
 from copy import deepcopy
 from mimicry.data import Carries
+from mimicry.mimicry import copy_carries, replicate_params
 
 from mimicry.network import Agent, create_agent, train
 
@@ -64,7 +65,7 @@ def reinforcement_learning():
     plt.close(fig)
     plt.close()
 
-Observation: TypeAlias = Tensor
+Observation: TypeAlias = npt.NDArray[np.float32]
 
 def sample_agent(rng: np.random.Generator, sensors: Tensor, agent: Agent) -> int:
     motors, carries = agent.model(sensors, agent.carries)
@@ -73,19 +74,21 @@ def sample_agent(rng: np.random.Generator, sensors: Tensor, agent: Agent) -> int
     action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)
     return action[0]
 
-def random_walks():
+
+
+def random_walks(headless: bool):
     rng = np.random.default_rng()
-    envs = [SparseCartPole("rgb_array") for _ in range(10)]
-    history: list[list[tuple[Observation, int, Carries]]] = [[] for _ in envs]
+    envs = [SparseCartPole("rgb_array") for _ in range(500)]
+    history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 4
     n_motors = 2
-    device = torch.device('cpu')
+    device = torch.device('cuda')
     agents = [
-        create_agent(n_sensors, n_motors, 40, 30, 20, device)
+        create_agent(n_sensors, n_motors, 10, 10, 10, device)
         for _ in envs
     ]
     lives = [0 for _ in envs]
-    max_history = 100
+    max_history = 10
     observations = [env.reset()[0] for env in envs]
     def get_frame(env: SparseCartPole) -> npt.NDArray[np.uint8]:
         frame = env.render()
@@ -100,9 +103,13 @@ def random_walks():
         image[ys,xs,:] = image[ys,xs,:] * 0.8 + frame[ys,xs,:] * 0.2
     fig = plt.figure()
     assert isinstance(fig, plt.Figure)
-    img = plt.imshow(image)
-    plt.show(block=False)
+    if not headless:
+        img = plt.imshow(image)
+        plt.show(block=False)
+    else:
+        img = None
     width, height = 600, 400
+    life_rate = 1.0
 
     now = datetime.now().strftime('%Y-%m-%dT%H%m%S')
     renders = Path('renders')
@@ -116,12 +123,36 @@ def random_walks():
     )
     for iteration in itertools.count():
         actions = [ env.action_space.sample() for env in envs]
+        with torch.no_grad():
+            agent_motors = []
+            for i, agent in enumerate(agents):
+                observation = observations[i]
+                if device.type == 'cuda':
+                    stream = torch.cuda.Stream()
+                    assert isinstance(stream, torch.cuda.Stream)
+                    with torch.cuda.stream(stream):
+                        sensors = (
+                            torch.from_numpy(observation)
+                            .to(device, non_blocking=True)
+                        )
+                        agent_motors.append(
+                            (sensors, agent.model(sensors, agent.carries))
+                        )
+                else:
+                    sensors = (
+                        torch.from_numpy(observation).to(device)
+                    )
+                    agent_motors.append(agent.model(sensors, agent.carries))
+        torch.cuda.synchronize()
+        for i, (sensors, (motors, carries)) in enumerate(agent_motors):
+            agent = agents[i]
+            agent.carries = carries
+
+            motor_probs = torch.exp(motors).cpu().detach().numpy()
+            action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)[0]
+            step = (sensors, action, carries)
+            history[i].append(step)
         for i, agent in enumerate(agents):
-            carries = agent.carries
-            sensors = torch.from_numpy(observations[i]).to(device)
-            with torch.no_grad():
-                action = sample_agent(rng, sensors, agent)
-            history[i].append((sensors, action, carries))
             if len(history[i]) > max_history:
                 history[i].pop(0)
         alives: list[bool] = []
@@ -130,6 +161,9 @@ def random_walks():
             observations[i] = obs
             alives.append(not terminated)
         n = len(alives)
+        alpha = 0.9
+        life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
+        print(life_rate)
         if not any(alives):
             for i, env in enumerate(envs):
                 env.reset()
@@ -144,16 +178,25 @@ def random_walks():
                 while not alives[k]:
                     k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
                 envs[i].state = deepcopy(envs[k].state)
-                agents[i].model.load_state_dict(deepcopy(agents[k].model.state_dict()))
-                agents[i].optimiser.load_state_dict(deepcopy(agents[k].optimiser.state_dict()))
+                replicate_params(
+                    agents[k].model.state_dict(),
+                    agents[i].model.state_dict(),
+                )
+                # agents[i].optimiser.load_state_dict(deepcopy(agents[k].optimiser.state_dict()))
                 history[i].clear()
-                for step in history[k]:
-                    history[i].append(step)
+                for (sensors, sampled, carries) in history[k]:
+                    history[i].append((sensors.clone(), sampled, copy_carries(carries)))
                 lives[i] = 0
-        print(np.amax(lives))
-        for i, agent in enumerate(agents):
-            if (iteration + i) % (max_history // 10) == 0:
-                train(agent, history[i])
+        to_train = [
+            i
+            for i, _ in enumerate(agents)
+            if (iteration + i) % (max_history // 10) == 0
+        ]
+        for i in to_train:
+            stream = torch.cuda.Stream()
+            assert isinstance(stream, torch.cuda.Stream)
+            with torch.cuda.stream(stream):
+                train(agents[i], history[i])
         frames = [get_frame(env) for env in envs[:10]]
         image = white.copy()
         for i, frame in enumerate(frames):
@@ -165,12 +208,17 @@ def random_walks():
                 red = np.array([255,0,0],dtype=np.uint8)
                 image[ys,xs,:] = image[ys,xs,:] * 0.8 + red * 0.2
         writer.stdin.write(image.tobytes())
-        img.set_data(image)
-        fig.canvas.draw()
-        fig.canvas.flush_events()
+        if img is not None:
+            img.set_data(image)
+            fig.canvas.draw()
+            fig.canvas.flush_events()
 
 def main():
-    random_walks()
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--headless', action='store_true')
+    args = parser.parse_args()
+    torch.set_num_threads(16)
+    random_walks(args.headless)
     # reinforcement_learning()
 
 

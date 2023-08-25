@@ -79,9 +79,13 @@
             };
           in
           poetry-env.env.overrideAttrs (old: {
+            shellHook = ''
+              export LD_LIBRARY_PATH=/run/opengl-driver/lib
+            '';
             nativeBuildInputs = old.nativeBuildInputs ++ [
               pkgs.pyright
               poetry-env.pkgs.ruff-lsp
+              poetry-env.pkgs.yappi
               pkgs.ruff
               pkgs.ffmpeg-full
             ];
