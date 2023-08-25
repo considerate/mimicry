@@ -1,5 +1,6 @@
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from math import exp
 import torch
 from torch import Tensor
 
@@ -72,7 +73,7 @@ def create_agent(n_sensors, n_motors, lstm_1, lstm_2, lstm_3, device) -> Agent:
     carry_3 = torch.zeros(lstm_3, device=device), torch.zeros(lstm_3, device=device)
     carries = carry, carry_2, carry_3
     #torch.optim.AdamW(model.parameters(), lr=0.01)
-    optimiser = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimiser = torch.optim.SGD(model.parameters(), lr=exp(-4.0))
     return Agent(
         carries,
         model,

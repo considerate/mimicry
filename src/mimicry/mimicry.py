@@ -1,9 +1,9 @@
 from collections.abc import Callable, Iterable, Sequence
+from typing import Any
 
 import pyglet
 import numpy as np
 import numpy.typing as npt
-from copy import deepcopy
 from math import tau
 import ffmpeg
 from pathlib import Path
@@ -20,10 +20,31 @@ from mimicry.car import (
     replicate_car,
     step_car
 )
-from mimicry.data import Bounds, Location, Polar, State
+from mimicry.data import Bounds, Carries, Location, Polar, State
 from mimicry.network import Agent, create_agent, train
 
 
+
+def replicate_params(source: dict[str, Any] | Any, target: dict[str, Any] | Any):
+    if not isinstance(source, dict):
+        return source
+    for key, v in source.items():
+        if isinstance(v, torch.Tensor):
+            t = target[key]
+            assert isinstance(t, torch.Tensor)
+            target[key] = t.copy_(v)
+        elif isinstance(v, dict):
+            target[key] = replicate_params(v, target[key])
+        elif isinstance(v, list):
+            t = target[key]
+            for i in range(len(v)):
+                t[i] = replicate_params(v[i], t[i])
+        else:
+            target[key] = v
+    return target
+
+def copy_carries(carries: Carries) -> Carries:
+    return tuple(tuple(t.clone() for t in x) for x in carries)
 
 def update(
     frame: int,
@@ -83,12 +104,20 @@ def update(
             while not alives[k]:
                 k = (k - 1) % n_cars if rng.random() < 0.5 else (k + 1) % n_cars
             replicate_car(state.cars[k], car)
-            agents[i].model.load_state_dict(deepcopy(agents[k].model.state_dict()))
-            agents[i].optimiser.load_state_dict(deepcopy(agents[k].optimiser.state_dict()))
+            replicate_params(
+                agents[k].model.state_dict(),
+                agents[i].model.state_dict(),
+            )
+            # replicate_params(
+            #     agents[k].optimiser.state_dict(),
+            #     agents[i].optimiser.state_dict(),
+            # )
             state.history[i].clear()
             state.trails[i].append([])
-            for h in state.history[k]:
-                state.history[i].append(h)
+            for (sensors, sampled, carries) in state.history[k]:
+                state.history[i].append(
+                    (sensors.clone(), sampled, copy_carries(carries))
+                )
     state.sensors = car_sensors(state.cars[0], sensor_field)
 
 def main(headless: bool = False):
@@ -100,7 +129,7 @@ def main(headless: bool = False):
         for d in (0.1, 0.2, 0.3, 0.4 ,0.5)
         for a in (0.25, 0.15, 0.05, -0.05, -0.15, -0.25)
     ]
-    motor_values = np.tanh(np.array([-1, -0.5, -0.25 -0.1, 0, 0.1, 0.25, 0.5, 1]))
+    motor_values = np.tanh(np.array([-1, -0.5, -0.1, 0, 0.1, 0.5, 1]))
     width, height = 1920, 1080
     window = pyglet.window.Window(width, height, resizable=True)
     pyglet.gl.glClearColor(0.85,0.85,0.85,1.0)
