@@ -18,6 +18,7 @@ import argparse
 from copy import deepcopy
 from mimicry.data import Carries
 from mimicry.mimicry import copy_carries, replicate_params
+from tqdm import tqdm
 
 from mimicry.network import Agent, create_agent, train
 
@@ -78,10 +79,73 @@ def sample_agent(rng: np.random.Generator, sensors: Tensor, agent: Agent) -> int
     return action[0]
 
 
+def predict_motors(observations, agents, device):
+    agent_motors = []
+    for i, agent in enumerate(agents):
+        observation = observations[i]
+        if device.type == 'cuda':
+            stream = torch.cuda.Stream()
+            assert isinstance(stream, torch.cuda.Stream)
+            with torch.cuda.stream(stream):
+                sensors = (
+                    torch.from_numpy(observation)
+                    .to(device, non_blocking=True)
+                )
+                agent_motors.append(
+                    (sensors, agent.model(sensors, agent.carries))
+                )
+        else:
+            sensors = (
+                torch.from_numpy(observation).to(device)
+            )
+            agent_motors.append(agent.model(sensors, agent.carries))
+    return agent_motors
+
+def replicate_agents(rng, alives, envs, agents, history):
+    n = len(alives)
+    if not any(alives):
+        for i, env in enumerate(envs):
+            env.reset()
+            history[i].clear()
+    else:
+        for i in range(n):
+            if alives[i]:
+                continue
+            k = i
+            while not alives[k]:
+                k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
+            envs[i].state = deepcopy(envs[k].state)
+            replicate_params(
+                agents[k].model.state_dict(),
+                agents[i].model.state_dict(),
+            )
+            replicate_params(
+                agents[k].optimiser.state_dict()["state"],
+                agents[i].optimiser.state_dict()["state"]
+            )
+            history[i].clear()
+            for (sensors, sampled, carries) in history[k]:
+                history[i].append((sensors.clone(), sampled, copy_carries(carries)))
+
+def step_agents(rng, agent_motors, agents, envs, observations):
+    alives = []
+    steps = []
+    for i, (sensors, (motors, carries)) in enumerate(agent_motors):
+        agent = agents[i]
+        agent.carries = carries
+
+        motor_probs = torch.exp(motors).cpu().detach().numpy()
+        action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)[0]
+        step = (sensors, action, carries)
+        steps.append(step)
+        obs, _, terminated, _, _ = envs[i].step(action)
+        observations[i] = obs
+        alives.append(not terminated)
+    return alives, steps
 
 def random_walks(headless: bool):
     rng = np.random.default_rng()
-    population = 50
+    population = 100
     envs = [SparseCartPole("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 4
@@ -91,31 +155,64 @@ def random_walks(headless: bool):
         create_agent(n_sensors, n_motors, 10, 10, 10, device)
         for _ in envs
     ]
-    lives = [0 for _ in envs]
     max_history = 10
     observations = [env.reset()[0] for env in envs]
+    width, height = 600, 400
+    life_rate = 1.0
+
+    now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
+    training_steps = 10_000
+    try:
+        bar = tqdm(range(training_steps))
+        for iteration in bar:
+            with torch.no_grad():
+                agent_motors = predict_motors(observations, agents, device)
+            torch.cuda.synchronize()
+            alpha = 0.9
+            with torch.no_grad():
+                alives, steps = step_agents(
+                    rng, agent_motors, agents, envs, observations
+                )
+            for i, step in enumerate(steps):
+                history[i].append(step)
+                if len(history[i]) > max_history:
+                    history[i].pop(0)
+            life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
+            bar.set_postfix({"life_rate": life_rate})
+            print(life_rate, flush=True)
+            replicate_agents(rng, alives, envs, agents, history)
+            to_train = [
+                i
+                for i, _ in enumerate(agents)
+                if (iteration + i) % (max_history // 10) == 0
+            ]
+            for i in to_train:
+                stream = torch.cuda.Stream()
+                assert isinstance(stream, torch.cuda.Stream)
+                with torch.cuda.stream(stream):
+                    train(agents[i], history[i])
+            torch.cuda.synchronize()
+    except KeyboardInterrupt:
+        pass
+    to_render = 10
     def get_frame(env: SparseCartPole) -> npt.NDArray[np.uint8]:
         frame = env.render()
         if frame is None:
             raise ValueError("No rgb_array returned from env.render()")
         return frame.astype(np.uint8)
-    frames = [get_frame(env) for env in envs[:10]]
-    white = np.full_like(frames[0], 255, dtype=np.uint8)
-    image = white.copy()
-    for frame in frames:
-        ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
-        image[ys,xs,:] = image[ys,xs,:] * 0.8 + frame[ys,xs,:] * 0.2
-    fig = plt.figure()
-    assert isinstance(fig, plt.Figure)
-    if not headless:
-        img = plt.imshow(image)
-        plt.show(block=False)
-    else:
-        img = None
-    width, height = 600, 400
-    life_rate = 1.0
 
-    now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
+    def overlay_frames(frames: list[npt.NDArray[np.uint8]]):
+        image = np.full_like(frames[0], fill_value=255, dtype=np.uint8)
+        for frame in frames:
+            ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
+            image[ys,xs,:] = \
+                image[ys,xs,:] * (1 - 1.0 / to_render) \
+                + frame[ys,xs,:] * (1.0 / to_render)
+        return image
+
+    frames = [get_frame(env) for env in envs[:to_render]]
+    fig = plt.figure()
+    image = overlay_frames(frames)
     renders = Path('renders')
     renders.mkdir(exist_ok=True)
     output_path = renders / f'render-{now}.mkv'
@@ -126,93 +223,25 @@ def random_walks(headless: bool):
         .run_async(pipe_stdin=True)
     )
     assert writer.stdin is not None
+    writer.stdin.write(image.tobytes())
+    assert isinstance(fig, plt.Figure)
+    if not headless:
+        img = plt.imshow(image)
+        plt.show(block=False)
+    else:
+        img = None
     for iteration in itertools.count():
-        actions = []
         with torch.no_grad():
-            agent_motors = []
-            for i, agent in enumerate(agents):
-                observation = observations[i]
-                if device.type == 'cuda':
-                    stream = torch.cuda.Stream()
-                    assert isinstance(stream, torch.cuda.Stream)
-                    with torch.cuda.stream(stream):
-                        sensors = (
-                            torch.from_numpy(observation)
-                            .to(device, non_blocking=True)
-                        )
-                        agent_motors.append(
-                            (sensors, agent.model(sensors, agent.carries))
-                        )
-                else:
-                    sensors = (
-                        torch.from_numpy(observation).to(device)
-                    )
-                    agent_motors.append(agent.model(sensors, agent.carries))
-        torch.cuda.synchronize()
-        for i, (sensors, (motors, carries)) in enumerate(agent_motors):
-            agent = agents[i]
-            agent.carries = carries
-
-            motor_probs = torch.exp(motors).cpu().detach().numpy()
-            action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)[0]
-            actions.append(action)
-            step = (sensors, action, carries)
-            history[i].append(step)
-        for i, agent in enumerate(agents):
-            if len(history[i]) > max_history:
-                history[i].pop(0)
-        alives: list[bool] = []
-        for i, env in enumerate(envs):
-            obs, reward, terminated, truncated, info = env.step(actions[i])
-            observations[i] = obs
-            alives.append(not terminated)
-        n = len(alives)
-        alpha = 0.9
-        life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
-        print(life_rate, flush=True)
-        if not any(alives):
-            for i, env in enumerate(envs):
-                env.reset()
-                lives[i] = 0
-                history[i].clear()
-        else:
-            for i in range(n):
-                if alives[i]:
-                    lives[i] += 1
-                    continue
-                k = i
-                while not alives[k]:
-                    k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
-                envs[i].state = deepcopy(envs[k].state)
-                replicate_params(
-                    agents[k].model.state_dict(),
-                    agents[i].model.state_dict(),
-                )
-                # agents[i].optimiser.load_state_dict(deepcopy(agents[k].optimiser.state_dict()))
-                history[i].clear()
-                for (sensors, sampled, carries) in history[k]:
-                    history[i].append((sensors.clone(), sampled, copy_carries(carries)))
-                lives[i] = 0
-        to_train = [
-            i
-            for i, _ in enumerate(agents)
-            if (iteration + i) % (max_history // 10) == 0
-        ]
-        for i in to_train:
-            stream = torch.cuda.Stream()
-            assert isinstance(stream, torch.cuda.Stream)
-            with torch.cuda.stream(stream):
-                train(agents[i], history[i])
-        frames = [get_frame(env) for env in envs[:10]]
-        image = white.copy()
-        for i, frame in enumerate(frames):
-            if alives[i]:
-                ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
-                image[ys,xs,:] = image[ys,xs,:] * 0.8 + frame[ys,xs,:] * 0.2
-            else:
-                ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
-                red = np.array([255,0,0],dtype=np.uint8)
-                image[ys,xs,:] = image[ys,xs,:] * 0.8 + red * 0.2
+            agent_motors = predict_motors(observations, agents[:to_render], device)
+        with torch.no_grad():
+            alives, _ = step_agents(
+                rng, agent_motors, agents, envs, observations
+            )
+        for i, alive in enumerate(alives):
+            if not alive:
+                envs[i].reset()
+        frames = [get_frame(env) for env in envs[:to_render]]
+        image = overlay_frames(frames)
         writer.stdin.write(image.tobytes())
         if img is not None:
             img.set_data(image)
