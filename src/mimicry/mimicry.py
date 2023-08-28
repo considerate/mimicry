@@ -44,7 +44,9 @@ def replicate_params(source: dict[str, Any] | float, target: dict[str, Any] | fl
             target[key] = v
     return target
 
-def copy_carries(carries: Carries) -> Carries:
+def copy_carries(carries: Carries | int) -> Carries | int:
+    if isinstance(carries, int):
+        return carries
     return tuple(tuple(t.clone() for t in x) for x in carries)
 
 def update(

@@ -20,7 +20,9 @@ from mimicry.data import Carries
 from mimicry.mimicry import copy_carries, replicate_params
 from tqdm import tqdm
 
-from mimicry.network import Agent, create_agent, train
+# from mimicry.network import Agent, create_agent, train
+from mimicry.feedforward import Agent, create_agent, train_one
+from mimicry.network import train
 
 class SparseCartPole(CartPoleEnv):
     def step(self, action):
@@ -30,7 +32,7 @@ class SparseCartPole(CartPoleEnv):
 
 def reinforcement_learning():
     model = A2C("MlpPolicy", SparseCartPole("rgb_array"), verbose=1)
-    model.learn(total_timesteps=10_000)
+    model.learn(total_timesteps=100_000)
     vec_env = model.get_env()
     assert vec_env is not None
     observation = vec_env.reset()
@@ -127,21 +129,40 @@ def replicate_agents(rng, alives, envs, agents, history):
             for (sensors, sampled, carries) in history[k]:
                 history[i].append((sensors.clone(), sampled, copy_carries(carries)))
 
-def step_agents(rng, agent_motors, agents, envs, observations):
+def step_agents(rng, agent_motors, agents, envs, observations, train=False):
     alives = []
     steps = []
     for i, (sensors, (motors, carries)) in enumerate(agent_motors):
         agent = agents[i]
+        if train:
+            agent.optimiser.zero_grad()
         agent.carries = carries
 
         motor_probs = torch.exp(motors).cpu().detach().numpy()
         action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)[0]
+        if train:
+            loss = -motors[action]
+            loss.backward()
+            agent.optimiser.step()
         step = (sensors, action, carries)
         steps.append(step)
         obs, _, terminated, _, _ = envs[i].step(action)
         observations[i] = obs
         alives.append(not terminated)
     return alives, steps
+
+def train_lstms(iteration: int, agents, history, max_history):
+    to_train = [
+        i
+        for i, _ in enumerate(agents)
+        if (iteration + i) % (max_history // 10) == 0
+    ]
+    for i in to_train:
+        stream = torch.cuda.Stream()
+        assert isinstance(stream, torch.cuda.Stream)
+        with torch.cuda.stream(stream):
+            train(agents[i], history[i])
+    torch.cuda.synchronize()
 
 def random_walks(headless: bool):
     rng = np.random.default_rng()
@@ -152,7 +173,7 @@ def random_walks(headless: bool):
     n_motors = 2
     device = torch.device('cuda')
     agents = [
-        create_agent(n_sensors, n_motors, 10, 10, 10, device)
+        create_agent(n_sensors, n_motors, 10, 10, device)
         for _ in envs
     ]
     max_history = 10
@@ -165,14 +186,12 @@ def random_walks(headless: bool):
     try:
         bar = tqdm(range(training_steps))
         for iteration in bar:
-            with torch.no_grad():
-                agent_motors = predict_motors(observations, agents, device)
+            agent_motors = predict_motors(observations, agents, device)
             torch.cuda.synchronize()
             alpha = 0.9
-            with torch.no_grad():
-                alives, steps = step_agents(
-                    rng, agent_motors, agents, envs, observations
-                )
+            alives, steps = step_agents(
+                rng, agent_motors, agents, envs, observations, train=True
+            )
             for i, step in enumerate(steps):
                 history[i].append(step)
                 if len(history[i]) > max_history:
@@ -181,17 +200,6 @@ def random_walks(headless: bool):
             bar.set_postfix({"life_rate": life_rate})
             print(life_rate, flush=True)
             replicate_agents(rng, alives, envs, agents, history)
-            to_train = [
-                i
-                for i, _ in enumerate(agents)
-                if (iteration + i) % (max_history // 10) == 0
-            ]
-            for i in to_train:
-                stream = torch.cuda.Stream()
-                assert isinstance(stream, torch.cuda.Stream)
-                with torch.cuda.stream(stream):
-                    train(agents[i], history[i])
-            torch.cuda.synchronize()
     except KeyboardInterrupt:
         pass
     to_render = 10
@@ -253,8 +261,8 @@ def main():
     parser.add_argument('--headless', action='store_true')
     args = parser.parse_args()
     torch.set_num_threads(16)
-    random_walks(args.headless)
-    # reinforcement_learning()
+    # random_walks(args.headless)
+    reinforcement_learning()
 
 
 if __name__ == '__main__':
