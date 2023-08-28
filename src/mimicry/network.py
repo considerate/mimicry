@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import exp
 import torch

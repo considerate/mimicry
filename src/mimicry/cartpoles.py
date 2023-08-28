@@ -1,8 +1,11 @@
 import itertools
+from subprocess import Popen
+from threading import Thread
 from typing import TypeAlias
 from gymnasium.envs.classic_control.cartpole import CartPoleEnv
 
 import matplotlib.pyplot as plt
+import sys
 import ffmpeg
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +39,7 @@ def reinforcement_learning():
     assert isinstance(fig, plt.Figure)
     image = plt.imshow(frame)
     plt.show(block=False)
-    now = datetime.now().strftime('%Y-%m-%dT%H%m%S')
+    now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
     renders = Path('renders')
     renders.mkdir(exist_ok=True)
     output_path = renders / f'a2c-{now}.mkv'
@@ -78,7 +81,8 @@ def sample_agent(rng: np.random.Generator, sensors: Tensor, agent: Agent) -> int
 
 def random_walks(headless: bool):
     rng = np.random.default_rng()
-    envs = [SparseCartPole("rgb_array") for _ in range(500)]
+    population = 50
+    envs = [SparseCartPole("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 4
     n_motors = 2
@@ -111,18 +115,19 @@ def random_walks(headless: bool):
     width, height = 600, 400
     life_rate = 1.0
 
-    now = datetime.now().strftime('%Y-%m-%dT%H%m%S')
+    now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
     renders = Path('renders')
     renders.mkdir(exist_ok=True)
     output_path = renders / f'render-{now}.mkv'
-    writer = (
+    writer: Popen = (
         ffmpeg
         .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}')
         .output(output_path.as_posix(), pix_fmt='yuv420p')
         .run_async(pipe_stdin=True)
     )
+    assert writer.stdin is not None
     for iteration in itertools.count():
-        actions = [ env.action_space.sample() for env in envs]
+        actions = []
         with torch.no_grad():
             agent_motors = []
             for i, agent in enumerate(agents):
@@ -150,6 +155,7 @@ def random_walks(headless: bool):
 
             motor_probs = torch.exp(motors).cpu().detach().numpy()
             action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)[0]
+            actions.append(action)
             step = (sensors, action, carries)
             history[i].append(step)
         for i, agent in enumerate(agents):
@@ -163,7 +169,7 @@ def random_walks(headless: bool):
         n = len(alives)
         alpha = 0.9
         life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
-        print(life_rate)
+        print(life_rate, flush=True)
         if not any(alives):
             for i, env in enumerate(envs):
                 env.reset()
