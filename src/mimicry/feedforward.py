@@ -1,8 +1,6 @@
 from dataclasses import dataclass
-from math import exp
 import torch
 from torch import Tensor
-import numpy as np
 
 
 class FeedForward(torch.nn.Module):
@@ -33,19 +31,9 @@ class Agent:
     model: FeedForward
     optimiser: torch.optim.Optimizer
 
-def train_one(rng: np.random.Generator, agent: Agent, sensors: Tensor) -> float:
-    agent.optimiser.zero_grad()
-    motors = agent.model(sensors)
-    motor_preds = torch.exp(motors).cpu().detach().numpy()
-    action = rng.choice(len(motor_preds),size=1)[0]
-    loss = -motors[action]
-    loss.backward()
-    agent.optimiser.step()
-    return loss.item()
-
-def create_agent(n_sensors, n_motors, lstm_1, lstm_2, device) -> Agent:
+def create_agent(n_sensors, n_motors, lstm_1, lstm_2, device, lr=0.01) -> Agent:
     model = FeedForward(n_sensors, n_motors, [lstm_1, lstm_2]).to(device)
-    optimiser = torch.optim.SGD(model.parameters(), lr=exp(-4.0))
+    optimiser = torch.optim.SGD(model.parameters(), lr=lr)
     return Agent(
         0,
         model,

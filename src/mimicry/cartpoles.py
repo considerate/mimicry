@@ -1,11 +1,9 @@
 import itertools
 from subprocess import Popen
-from threading import Thread
 from typing import TypeAlias
 from gymnasium.envs.classic_control.cartpole import CartPoleEnv
 
 import matplotlib.pyplot as plt
-import sys
 import ffmpeg
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +19,7 @@ from mimicry.mimicry import copy_carries, replicate_params
 from tqdm import tqdm
 
 # from mimicry.network import Agent, create_agent, train
-from mimicry.feedforward import Agent, create_agent, train_one
+from mimicry.feedforward import Agent, create_agent
 from mimicry.network import train
 
 class SparseCartPole(CartPoleEnv):
@@ -166,29 +164,29 @@ def train_lstms(iteration: int, agents, history, max_history):
 
 def random_walks(headless: bool):
     rng = np.random.default_rng()
-    population = 100
+    population = 20
     envs = [SparseCartPole("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 4
     n_motors = 2
     device = torch.device('cuda')
     agents = [
-        create_agent(n_sensors, n_motors, 10, 10, device)
+        create_agent(n_sensors, n_motors, 10, 10, device, lr=0.1)
         for _ in envs
     ]
-    max_history = 10
+    max_history = 1
     observations = [env.reset()[0] for env in envs]
     width, height = 600, 400
-    life_rate = 1.0
+    life_rate = 0.0
 
     now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
-    training_steps = 10_000
+    training_steps = 100_000
     try:
         bar = tqdm(range(training_steps))
         for iteration in bar:
             agent_motors = predict_motors(observations, agents, device)
             torch.cuda.synchronize()
-            alpha = 0.9
+            alpha = 0.999
             alives, steps = step_agents(
                 rng, agent_motors, agents, envs, observations, train=True
             )
@@ -197,7 +195,8 @@ def random_walks(headless: bool):
                 if len(history[i]) > max_history:
                     history[i].pop(0)
             life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
-            bar.set_postfix({"life_rate": life_rate})
+            expected_life = 1.0 / (1.0 - life_rate)
+            bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
             print(life_rate, flush=True)
             replicate_agents(rng, alives, envs, agents, history)
     except KeyboardInterrupt:
@@ -261,8 +260,7 @@ def main():
     parser.add_argument('--headless', action='store_true')
     args = parser.parse_args()
     torch.set_num_threads(16)
-    # random_walks(args.headless)
-    reinforcement_learning()
+    random_walks(args.headless)
 
 
 if __name__ == '__main__':
