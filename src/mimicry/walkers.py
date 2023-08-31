@@ -62,22 +62,20 @@ def replicate_joint(source: b2RevoluteJoint, target: b2RevoluteJoint):
     target.motorSpeed = source.motorSpeed
     target.upperLimit = source.upperLimit
     target.lowerLimit = source.lowerLimit
-    target.limits = source.limits
     target.motorEnabled = source.motorEnabled
     target.limitEnabled = source.limitEnabled
 
 def replicate_leg(source: b2Body, target: b2Body):
     # https://github.com/openai/box2d-py/blob/647d6c66710cfe3ff81b3e80522ff92624a77b41/Box2D/Box2D_bodyfixture.i#L326
-    target.position = source.position
-    target.angle = source.angle
+    target.transform = (source.position.copy(), source.angle)
+    target.linearVelocity = source.linearVelocity.copy()
+    target.localCenter = source.localCenter.copy()
     target.inertia = source.inertia
     target.awake = source.awake
-    target.linearVelocity = source.linearVelocity
     target.angularVelocity = source.angularVelocity
     target.angularDamping = source.angularDamping
     target.linearDamping = source.linearDamping
     target.fixedRotation = source.fixedRotation
-    target.localCenter = source.localCenter
 
 def replicate_hull(source: b2Body, target: b2Body):
     # there's not difference in replicating the hull to replicating a leg
@@ -96,10 +94,15 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
             k = i
             while not alives[k]:
                 k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
+            envs[i].reset()
             for j, joint in enumerate(envs[k].joints):
                 replicate_joint(joint, envs[i].joints[j])
             for j, leg in enumerate(envs[k].legs):
                 replicate_leg(leg, envs[i].legs[j])
+                envs[i].legs[j].ground_contact = False
+            envs[i].scroll = envs[k].scroll
+            envs[i].game_over = envs[k].game_over
+            envs[i].lidar_render = envs[k].lidar_render
             source_hull = envs[k].hull
             target_hull = envs[i].hull
             assert source_hull is not None
@@ -179,7 +182,7 @@ def overlay_frames(frames: list[npt.NDArray[np.uint8]], to_render: int):
 
 def walkers(headless: bool, show_training: bool):
     rng = np.random.default_rng()
-    population = 3
+    population = 30
     envs = [BipedalWalker("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 24
@@ -201,11 +204,17 @@ def walkers(headless: bool, show_training: bool):
     training_steps = 100_000
     fig = plt.figure()
     assert isinstance(fig, plt.Figure)
-    to_render = 3
+    xs = plt.subplot(2, 2, 1)
+    ys = plt.subplot(2, 2, 2)
+    ax = plt.subplot(2, 1, 2)
+    to_render = 5
+    histogram = None
     if not headless and show_training:
         frames = [get_frame(env) for env in envs[:to_render]]
         image = overlay_frames(frames, to_render)
-        img = plt.imshow(image)
+        xs.hist([env.hull.position.x for env in envs if env.hull])
+        ys.hist([env.hull.position.y for env in envs if env.hull])
+        img = ax.imshow(image)
         plt.show(block=False)
     else:
         img = None
@@ -222,6 +231,11 @@ def walkers(headless: bool, show_training: bool):
                     train_agents=True,
                     min_logvar=min_logvar,
                 )
+                # kill the worst agent every frame
+                worst = np.argmin([env.scroll for env in envs])
+                alives[worst] = False
+                worst = np.argmin([env.hull.position.y for env in envs if env.hull])
+                alives[worst] = False
                 for i, step in enumerate(steps):
                     history[i].append(step)
                     if len(history[i]) > max_history:
@@ -236,8 +250,12 @@ def walkers(headless: bool, show_training: bool):
                     image = overlay_frames(frames, to_render)
                     if img is not None:
                         img.set_data(image)
-                        fig.canvas.draw()
-                        fig.canvas.flush_events()
+                    xs.clear()
+                    xs.hist([env.hull.position.x for env in envs if env.hull])
+                    ys.clear()
+                    ys.hist([env.hull.position.y for env in envs if env.hull])
+                    fig.canvas.draw()
+                    fig.canvas.flush_events()
     except KeyboardInterrupt:
         pass
 
@@ -254,7 +272,11 @@ def walkers(headless: bool, show_training: bool):
     assert writer.stdin is not None
     writer.stdin.write(image.tobytes())
     if not headless:
-        img = plt.imshow(image)
+        xs.clear()
+        xs.hist([env.hull.position.x for env in envs if env.hull])
+        ys.clear()
+        ys.hist([env.hull.position.y for env in envs if env.hull])
+        img = ax.imshow(image)
         plt.show(block=False)
     else:
         img = None
@@ -271,6 +293,10 @@ def walkers(headless: bool, show_training: bool):
         frames = [get_frame(env) for env in envs[:to_render]]
         image = overlay_frames(frames, to_render)
         if img is not None:
+            xs.clear()
+            xs.hist([env.hull.position.x for env in envs[:to_render] if env.hull])
+            ys.clear()
+            ys.hist([env.hull.position.y for env in envs[:to_render] if env.hull])
             img.set_data(image)
             fig.canvas.draw()
             fig.canvas.flush_events()
