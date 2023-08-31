@@ -22,8 +22,7 @@ class FeedForward(torch.nn.Module):
 
     def forward(self, x: Tensor, _) -> tuple[Tensor, int]:
         motors = self.decode(self.encode(x))
-        motor_preds = torch.nn.functional.log_softmax(motors)
-        return motor_preds, 0
+        return motors, 0
 
 @dataclass
 class Agent:

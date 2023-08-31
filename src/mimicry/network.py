@@ -31,8 +31,7 @@ class Network(torch.nn.Module):
         z = self.dense(x)
         mid = z + y_3
         motors = self.motors(mid)
-        motor_preds = torch.nn.functional.log_softmax(motors)
-        return motor_preds, ((y, new_carry), (y_2, new_carry_2), (y_3, new_carry_3))
+        return motors, ((y, new_carry), (y_2, new_carry_2), (y_3, new_carry_3))
 
 def sequence_loss(
     model: torch.nn.Module,
@@ -43,7 +42,8 @@ def sequence_loss(
     carry = initialcarry
     for (sensors, sampled) in sequence:
         motors, carry = model(sensors, carry)
-        logloss = -motors[sampled]
+        motor_preds = torch.nn.functional.log_softmax(motors, dim=-1)
+        logloss = -motor_preds[sampled]
         loss = loss + logloss
     return loss
 

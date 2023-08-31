@@ -12,6 +12,7 @@ numpy = "^1.25.2"
 torch = "^2.0.1"
 pyglet = "^2.0.9"
 ffmpeg-python = "^0.2.0"
+gymnasium = {version = "*", extras = ["box2d"]}
 stable-baselines3 = {version = "^2.1.0", extras = ["extra"]}
 matplotlib = "^3.7.2"
 pyqt6 = "^6.5.2"
@@ -23,6 +24,7 @@ cars = "mimicry.mimicry:main"
 headless-cars = "mimicry.headless:main"
 poles = "mimicry.cartpoles:main"
 a2c-poles = "mimicry.cartpoles:reinforcement_learning"
+walkers = "mimicry.walkers:main"
 
 [build-system]
 requires = ["poetry-core"]

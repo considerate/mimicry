@@ -48,6 +48,12 @@
                       pyfinal.setuptools
                     ];
                   });
+                  box2d-py = pyprev.box2d-py.overridePythonAttrs (old: {
+                    nativeBuildInputs = old.nativeBuildInputs ++ [
+                      pyfinal.setuptools
+                      pkgs.swig
+                    ];
+                  });
                   autorom-accept-rom-license = pyprev.autorom-accept-rom-license.overridePythonAttrs (old: {
                     nativeBuildInputs = old.nativeBuildInputs ++ [
                       pyfinal.setuptools

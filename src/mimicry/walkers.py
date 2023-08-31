@@ -1,83 +1,23 @@
 import itertools
+from math import log
 from subprocess import Popen
-from typing import TypeAlias
-from gymnasium.envs.classic_control.cartpole import CartPoleEnv
+from gymnasium.envs.box2d.bipedal_walker import BipedalWalker
+import gymnasium
 
 import matplotlib.pyplot as plt
 import ffmpeg
 from datetime import datetime
 from pathlib import Path
-from stable_baselines3 import A2C
 import numpy as np
 import numpy.typing as npt
 import torch
 from torch import Tensor
-import argparse
-from copy import deepcopy
 from mimicry.data import Carries
-from mimicry.mimicry import copy_carries, replicate_params
 from tqdm import tqdm
 
 # from mimicry.network import Agent, create_agent, train
-from mimicry.feedforward import Agent, create_agent
-from mimicry.network import train
-
-class SparseCartPole(CartPoleEnv):
-    def step(self, action):
-        observation, _, terminated, truncated, info = super().step(action)
-        reward = -1.0 if terminated else 0.0
-        return observation, reward, terminated, truncated, info
-
-def reinforcement_learning():
-    model = A2C("MlpPolicy", SparseCartPole("rgb_array"), verbose=1)
-    model.learn(total_timesteps=100_000)
-    vec_env = model.get_env()
-    assert vec_env is not None
-    observation = vec_env.reset()
-
-    frame = vec_env.render()
-    fig = plt.figure()
-    assert isinstance(fig, plt.Figure)
-    image = plt.imshow(frame)
-    plt.show(block=False)
-    now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
-    renders = Path('renders')
-    renders.mkdir(exist_ok=True)
-    output_path = renders / f'a2c-{now}.mkv'
-    width, height = 600, 400
-    writer = (
-        ffmpeg
-        .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}')
-        .output(output_path.as_posix(), pix_fmt='yuv420p')
-        .run_async(pipe_stdin=True)
-    )
-    for _ in range(1000):
-        # agent policy that uses the observation and info
-        action, _state = model.predict(observation, deterministic=True) # type: ignore
-        observation, _reward, terminated, _info = vec_env.step(action)
-        frame = vec_env.render("rgb_array")
-        assert isinstance(frame, np.ndarray)
-        if terminated:
-            ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
-            red = np.array([255,0,0],dtype=np.uint8)
-            frame[ys,xs,:] = frame[ys,xs,:] * 0.8 + red * 0.2
-        writer.stdin.write(frame.tobytes())
-        image.set_data(frame)
-        fig.canvas.draw()
-        fig.canvas.flush_events()
-    vec_env.close()
-    plt.close(fig)
-    plt.close()
-
-Observation: TypeAlias = npt.NDArray[np.float32]
-
-def sample_agent(rng: np.random.Generator, sensors: Tensor, agent: Agent) -> int:
-    motors, carries = agent.model(sensors, agent.carries)
-    agent.carries = carries
-    motor_preds = torch.nn.functional.softmax(motors, dim=-1)
-    motor_probs = motor_preds.cpu().detach().numpy()
-    action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)
-    return action[0]
+from mimicry.feedforward import create_agent
+from mimicry.mimicry import copy_carries, replicate_params
 
 
 def predict_motors(observations, agents, device):
@@ -102,6 +42,20 @@ def predict_motors(observations, agents, device):
             agent_motors.append((sensors, agent.model(sensors, agent.carries)))
     return agent_motors
 
+
+def gaussian_log_negative_log_loss(
+    means: Tensor,
+    vars: Tensor,
+    logvars: Tensor,
+    sampled: Tensor,
+    min_logvar: Tensor,
+):
+    logvars = torch.maximum(logvars, min_logvar)
+    squared_deviations = (sampled-means) ** 2
+    return 0.5*torch.sum(
+        squared_deviations * vars + logvars
+    )
+
 def replicate_agents(rng, alives, envs, agents, history):
     n = len(alives)
     if not any(alives):
@@ -115,7 +69,8 @@ def replicate_agents(rng, alives, envs, agents, history):
             k = i
             while not alives[k]:
                 k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
-            envs[i].state = deepcopy(envs[k].state)
+            # envs[i].state = deepcopy(envs[k].state)
+            envs[i].reset()
             replicate_params(
                 agents[k].model.state_dict(),
                 agents[i].model.state_dict(),
@@ -128,54 +83,64 @@ def replicate_agents(rng, alives, envs, agents, history):
             for (sensors, sampled, carries) in history[k]:
                 history[i].append((sensors.clone(), sampled, copy_carries(carries)))
 
-def step_agents(rng, agent_motors, agents, envs, observations, train=False):
+
+def step_agents(
+    rng: np.random.Generator,
+    agent_motors,
+    agents,
+    envs,
+    observations,
+    min_logvar,
+    train_agents=False
+):
     alives = []
     steps = []
     for i, (sensors, (motors, carries)) in enumerate(agent_motors):
         agent = agents[i]
-        if train:
+        if train_agents:
             agent.optimiser.zero_grad()
         agent.carries = carries
 
-        motor_probs = torch.nn.functional.softmax(motors, dim=-1).cpu().detach().numpy()
-        action = rng.choice(np.arange(len(motor_probs)), p=motor_probs, size=1)[0]
-        if train:
-            loss = -motors[action]
+        n_motors = len(motors)
+        means = motors[0:n_motors//2]
+        logvars = motors[n_motors//2:]
+        vars = torch.exp(-logvars)
+        mean_arr = means.detach().cpu().numpy()
+        var_arr = vars.detach().cpu().numpy()
+        actions = torch.tensor([
+            np.clip(rng.normal(mean, max(0.01, np.sqrt(var))), -1.0, 1.0)
+            for (mean, var) in zip(mean_arr, var_arr, strict=True)
+        ])
+        if train_agents:
+            device_actions = actions.to(means.device)
+            loss = gaussian_log_negative_log_loss(
+                means, vars, logvars, device_actions, min_logvar
+            )
             loss.backward()
             agent.optimiser.step()
-        step = (sensors, action, carries)
+        step = (sensors, actions, carries)
         steps.append(step)
-        obs, _, terminated, _, _ = envs[i].step(action)
+        box = actions.numpy()
+        obs, _, terminated, _, _ = envs[i].step(box)
         observations[i] = obs
         alives.append(not terminated)
     return alives, steps
 
-def train_lstms(iteration: int, agents, history, max_history):
-    to_train = [
-        i
-        for i, _ in enumerate(agents)
-        if (iteration + i) % (max_history // 10) == 0
-    ]
-    for i in to_train:
-        stream = torch.cuda.Stream()
-        assert isinstance(stream, torch.cuda.Stream)
-        with torch.cuda.stream(stream):
-            train(agents[i], history[i])
-    torch.cuda.synchronize()
 
-def random_walks(headless: bool):
+def walkers(headless: bool):
     rng = np.random.default_rng()
     population = 20
-    envs = [SparseCartPole("rgb_array") for _ in range(population)]
+    envs = [BipedalWalker("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
-    n_sensors = 4
-    n_motors = 2
-    device = torch.device('cuda')
+    n_sensors = 24
+    n_motors = 4 * 2
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     agents = [
         create_agent(n_sensors, n_motors, 10, 10, device, lr=0.1)
         for _ in envs
     ]
     max_history = 1
+    min_logvar = torch.scalar_tensor(2.0*log(0.01), device=device)
     observations = [env.reset()[0] for env in envs]
     width, height = 600, 400
     life_rate = 0.0
@@ -186,10 +151,13 @@ def random_walks(headless: bool):
         bar = tqdm(range(training_steps))
         for iteration in bar:
             agent_motors = predict_motors(observations, agents, device)
-            torch.cuda.synchronize()
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
             alpha = 0.999
             alives, steps = step_agents(
-                rng, agent_motors, agents, envs, observations, train=True
+                rng, agent_motors, agents, envs, observations,
+                train_agents=True,
+                min_logvar=min_logvar,
             )
             for i, step in enumerate(steps):
                 history[i].append(step)
@@ -199,14 +167,16 @@ def random_walks(headless: bool):
             expected_life = 1.0 / (1.0 - life_rate)
             bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
             print(life_rate, flush=True)
-            replicate_agents(rng, alives, envs, agents, history)
+            # replicate_agents(rng, alives, envs, agents, history)
     except KeyboardInterrupt:
         pass
     to_render = 10
-    def get_frame(env: SparseCartPole) -> npt.NDArray[np.uint8]:
+    def get_frame(env: gymnasium.Env) -> npt.NDArray[np.uint8]:
         frame = env.render()
         if frame is None:
             raise ValueError("No rgb_array returned from env.render()")
+        elif isinstance(frame, list):
+            raise ValueError("Expected single frame in get_frame()")
         return frame.astype(np.uint8)
 
     def overlay_frames(frames: list[npt.NDArray[np.uint8]]):
@@ -243,7 +213,7 @@ def random_walks(headless: bool):
             agent_motors = predict_motors(observations, agents[:to_render], device)
         with torch.no_grad():
             alives, _ = step_agents(
-                rng, agent_motors, agents, envs, observations
+                rng, agent_motors, agents, envs, observations, min_logvar,
             )
         for i, alive in enumerate(alives):
             if not alive:
@@ -257,12 +227,4 @@ def random_walks(headless: bool):
             fig.canvas.flush_events()
 
 def main():
-    parser=argparse.ArgumentParser()
-    parser.add_argument('--headless', action='store_true')
-    args = parser.parse_args()
-    torch.set_num_threads(16)
-    random_walks(args.headless)
-
-
-if __name__ == '__main__':
-    main()
+    walkers(False)
