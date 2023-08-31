@@ -302,5 +302,8 @@ def walkers(headless: bool, show_training: bool):
             fig.canvas.flush_events()
         writer.stdin.write(image.tobytes())
 
+def headless():
+    walkers(True, False)
+
 def main():
     walkers(False, True)
