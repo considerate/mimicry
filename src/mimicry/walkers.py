@@ -1,6 +1,7 @@
 import itertools
 from math import log
 from subprocess import Popen
+from Box2D import b2Body, b2RevoluteJoint
 from gymnasium.envs.box2d.bipedal_walker import BipedalWalker
 import gymnasium
 
@@ -56,7 +57,33 @@ def gaussian_log_negative_log_loss(
         squared_deviations * vars + logvars
     )
 
-def replicate_agents(rng, alives, envs, agents, history):
+def replicate_joint(source: b2RevoluteJoint, target: b2RevoluteJoint):
+    # https://github.com/openai/box2d-py/blob/647d6c66710cfe3ff81b3e80522ff92624a77b41/Box2D/Box2D_joints.i#L86
+    target.motorSpeed = source.motorSpeed
+    target.upperLimit = source.upperLimit
+    target.lowerLimit = source.lowerLimit
+    target.limits = source.limits
+    target.motorEnabled = source.motorEnabled
+    target.limitEnabled = source.limitEnabled
+
+def replicate_leg(source: b2Body, target: b2Body):
+    # https://github.com/openai/box2d-py/blob/647d6c66710cfe3ff81b3e80522ff92624a77b41/Box2D/Box2D_bodyfixture.i#L326
+    target.position = source.position
+    target.angle = source.angle
+    target.inertia = source.inertia
+    target.awake = source.awake
+    target.linearVelocity = source.linearVelocity
+    target.angularVelocity = source.angularVelocity
+    target.angularDamping = source.angularDamping
+    target.linearDamping = source.linearDamping
+    target.fixedRotation = source.fixedRotation
+    target.localCenter = source.localCenter
+
+def replicate_hull(source: b2Body, target: b2Body):
+    # there's not difference in replicating the hull to replicating a leg
+    replicate_leg(source, target)
+
+def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
     n = len(alives)
     if not any(alives):
         for i, env in enumerate(envs):
@@ -69,8 +96,15 @@ def replicate_agents(rng, alives, envs, agents, history):
             k = i
             while not alives[k]:
                 k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
-            # envs[i].state = deepcopy(envs[k].state)
-            envs[i].reset()
+            for j, joint in enumerate(envs[k].joints):
+                replicate_joint(joint, envs[i].joints[j])
+            for j, leg in enumerate(envs[k].legs):
+                replicate_leg(leg, envs[i].legs[j])
+            source_hull = envs[k].hull
+            target_hull = envs[i].hull
+            assert source_hull is not None
+            assert target_hull is not None
+            replicate_hull(source_hull, target_hull)
             replicate_params(
                 agents[k].model.state_dict(),
                 agents[i].model.state_dict(),
@@ -126,10 +160,26 @@ def step_agents(
         alives.append(not terminated)
     return alives, steps
 
+def get_frame(env: gymnasium.Env) -> npt.NDArray[np.uint8]:
+    frame = env.render()
+    if frame is None:
+        raise ValueError("No rgb_array returned from env.render()")
+    elif isinstance(frame, list):
+        raise ValueError("Expected single frame in get_frame()")
+    return frame.astype(np.uint8)
 
-def walkers(headless: bool):
+def overlay_frames(frames: list[npt.NDArray[np.uint8]], to_render: int):
+    image = np.full_like(frames[0], fill_value=255, dtype=np.uint8)
+    for frame in frames:
+        ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
+        image[ys,xs,:] = \
+            image[ys,xs,:] * (1 - 1.0 / to_render) \
+            + frame[ys,xs,:] * (1.0 / to_render)
+    return image
+
+def walkers(headless: bool, show_training: bool):
     rng = np.random.default_rng()
-    population = 20
+    population = 3
     envs = [BipedalWalker("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 24
@@ -146,54 +196,55 @@ def walkers(headless: bool):
     life_rate = 0.0
 
     now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
-    training_steps = 100_000
-    try:
-        bar = tqdm(range(training_steps))
-        for iteration in bar:
-            agent_motors = predict_motors(observations, agents, device)
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            alpha = 0.999
-            alives, steps = step_agents(
-                rng, agent_motors, agents, envs, observations,
-                train_agents=True,
-                min_logvar=min_logvar,
-            )
-            for i, step in enumerate(steps):
-                history[i].append(step)
-                if len(history[i]) > max_history:
-                    history[i].pop(0)
-            life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
-            expected_life = 1.0 / (1.0 - life_rate)
-            bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
-            print(life_rate, flush=True)
-            # replicate_agents(rng, alives, envs, agents, history)
-    except KeyboardInterrupt:
-        pass
-    to_render = 10
-    def get_frame(env: gymnasium.Env) -> npt.NDArray[np.uint8]:
-        frame = env.render()
-        if frame is None:
-            raise ValueError("No rgb_array returned from env.render()")
-        elif isinstance(frame, list):
-            raise ValueError("Expected single frame in get_frame()")
-        return frame.astype(np.uint8)
-
-    def overlay_frames(frames: list[npt.NDArray[np.uint8]]):
-        image = np.full_like(frames[0], fill_value=255, dtype=np.uint8)
-        for frame in frames:
-            ys, xs = np.where(np.all(frame != (255,255,255), axis=-1))
-            image[ys,xs,:] = \
-                image[ys,xs,:] * (1 - 1.0 / to_render) \
-                + frame[ys,xs,:] * (1.0 / to_render)
-        return image
-
-    frames = [get_frame(env) for env in envs[:to_render]]
-    fig = plt.figure()
-    image = overlay_frames(frames)
     renders = Path('renders')
     renders.mkdir(exist_ok=True)
-    output_path = renders / f'render-{now}.mkv'
+    training_steps = 100_000
+    fig = plt.figure()
+    assert isinstance(fig, plt.Figure)
+    to_render = 3
+    if not headless and show_training:
+        frames = [get_frame(env) for env in envs[:to_render]]
+        image = overlay_frames(frames, to_render)
+        img = plt.imshow(image)
+        plt.show(block=False)
+    else:
+        img = None
+    try:
+        with (renders / f'walker-{now}-training.log').open("w") as logfile:
+            bar = tqdm(range(training_steps), ncols=90)
+            for iteration in bar:
+                agent_motors = predict_motors(observations, agents, device)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                alpha = 0.999
+                alives, steps = step_agents(
+                    rng, agent_motors, agents, envs, observations,
+                    train_agents=True,
+                    min_logvar=min_logvar,
+                )
+                for i, step in enumerate(steps):
+                    history[i].append(step)
+                    if len(history[i]) > max_history:
+                        history[i].pop(0)
+                replicate_agents(rng, alives, envs, agents, history)
+                life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
+                expected_life = 1.0 / (1.0 - life_rate)
+                bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
+                print(life_rate, file=logfile, flush=True)
+                if show_training:
+                    frames = [get_frame(env) for env in envs[:to_render]]
+                    image = overlay_frames(frames, to_render)
+                    if img is not None:
+                        img.set_data(image)
+                        fig.canvas.draw()
+                        fig.canvas.flush_events()
+    except KeyboardInterrupt:
+        pass
+
+    observations = [env.reset()[0] for env in envs[:to_render]]
+    frames = [get_frame(env) for env in envs[:to_render]]
+    image = overlay_frames(frames, to_render)
+    output_path = renders / f'walker-{now}.mkv'
     writer: Popen = (
         ffmpeg
         .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}')
@@ -202,7 +253,6 @@ def walkers(headless: bool):
     )
     assert writer.stdin is not None
     writer.stdin.write(image.tobytes())
-    assert isinstance(fig, plt.Figure)
     if not headless:
         img = plt.imshow(image)
         plt.show(block=False)
@@ -219,12 +269,12 @@ def walkers(headless: bool):
             if not alive:
                 envs[i].reset()
         frames = [get_frame(env) for env in envs[:to_render]]
-        image = overlay_frames(frames)
-        writer.stdin.write(image.tobytes())
+        image = overlay_frames(frames, to_render)
         if img is not None:
             img.set_data(image)
             fig.canvas.draw()
             fig.canvas.flush_events()
+        writer.stdin.write(image.tobytes())
 
 def main():
-    walkers(False)
+    walkers(False, True)
