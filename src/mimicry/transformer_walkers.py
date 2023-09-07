@@ -1,7 +1,8 @@
 from collections.abc import Sequence
-import itertools
+import json
 from math import log
 from subprocess import Popen
+from typing import Any
 from Box2D import b2Body, b2RevoluteJoint
 from gymnasium.envs.box2d.bipedal_walker import BipedalWalker
 import gymnasium
@@ -205,6 +206,11 @@ def reset_in_place(env: BipedalWalker):
     for leg in env.legs:
         leg.position.x += diff
 
+def write_json_record(record: dict[str, Any], file) -> None:
+    file.write("\x1e")
+    json.dump(record, file)
+    file.write("\n")
+
 def walkers(headless: bool, show_training: bool):
     rng = np.random.default_rng()
     population = 100
@@ -244,7 +250,10 @@ def walkers(headless: bool, show_training: bool):
     else:
         img = None
     try:
-        with (renders / f'walker-{now}-training.log').open("w") as logfile:
+        with (
+            (renders / f'walker-{now}-training.log').open("w") as logfile,
+            (renders / f'walker-{now}-training.json-seq').open("a") as jsonlog,
+        ):
             bar = tqdm(range(training_steps), ncols=90)
             for _ in bar:
                 alpha = 0.999
@@ -278,6 +287,18 @@ def walkers(headless: bool, show_training: bool):
                 expected_life = 1.0 / (1.0 - life_rate)
                 bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
                 print(life_rate, file=logfile, flush=True)
+                write_json_record({
+                    "life_rate": life_rate,
+                    "alives": alives,
+                    "hulls": [
+                        {"pos": {"x": env.hull.position.x, "y": env.hull.position.y},
+                         "vel": {"x": env.hull.linearVelocity.x, "y": env.hull.linearVelocity.y},
+                         "ang": env.hull.angularVelocity,
+                        }
+                        for env in envs
+                        if env.hull is not None
+                    ],
+                }, file=jsonlog)
                 if show_training:
                     frames = [get_frame(env) for env in envs[:to_render]]
                     image = overlay_frames(frames, to_render)
