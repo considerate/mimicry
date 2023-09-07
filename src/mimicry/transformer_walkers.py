@@ -14,36 +14,11 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from torch import Tensor
-from mimicry.data import Carries
 from tqdm import tqdm
 
 # from mimicry.network import Agent, create_agent, train
-from mimicry.feedforward import Agent, create_agent
-from mimicry.mimicry import copy_carries, replicate_params
-
-
-def predict_motors(observations, agents, device):
-    agent_motors = []
-    for i, agent in enumerate(agents):
-        observation = observations[i]
-        if device.type == 'cuda':
-            stream = torch.cuda.Stream()
-            assert isinstance(stream, torch.cuda.Stream)
-            with torch.cuda.stream(stream):
-                sensors = (
-                    torch.from_numpy(observation)
-                    .to(device, non_blocking=True)
-                )
-                agent_motors.append(
-                    (sensors, agent.model(sensors, agent.carries))
-                )
-        else:
-            sensors = (
-                torch.from_numpy(observation).to(device)
-            )
-            agent_motors.append((sensors, agent.model(sensors, agent.carries)))
-    return agent_motors
-
+from mimicry.transformer import Agent, create_agent
+from mimicry.mimicry import replicate_params
 
 def gaussian_log_negative_log_loss(
     means: Tensor,
@@ -116,30 +91,42 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
                 agents[i].optimiser.state_dict()["state"]
             )
             history[i].clear()
-            for (sensors, sampled, carries) in history[k]:
-                history[i].append((sensors.clone(), sampled, copy_carries(carries)))
+            for (sensors, sampled) in history[k]:
+                history[i].append((sensors.clone(), sampled))
 
 
 def step_agents(
     rng: np.random.Generator,
-    agent_motors,
+    histories: list[list[tuple[Tensor, Tensor]]],
     agents: Sequence[Agent],
     envs,
     observations,
     min_logvar,
+    max_logvar,
+    device,
     train_agents=False
-):
+) -> tuple[list[bool], list[tuple[Tensor, Tensor]]]:
     alives = []
     steps = []
-    for i, (sensors, (motors, carries)) in enumerate(agent_motors):
+    one = torch.scalar_tensor(1.0,dtype=torch.float32).to(device)
+    for i, history in enumerate(histories):
         agent = agents[i]
+        current_sensor = torch.from_numpy(observations[i]).to(device)
+        sensors = torch.stack(
+            [sensor.unsqueeze(0) for (sensor, _) in history] +
+            [current_sensor.unsqueeze(0)]
+        )
+        motors_sequence = agent.model(sensors)
         if train_agents:
             agent.optimiser.zero_grad()
-        agent.carries = carries
 
+        motors = motors_sequence[-1,0,:]
         n_motors = len(motors)
-        means = motors[0:n_motors//2]
-        logvars = torch.maximum(motors[n_motors//2:], min_logvar)
+        means = torch.clip(motors[0:n_motors//2], -one, one)
+        logvars = torch.minimum(
+            max_logvar,
+            torch.maximum(motors[n_motors//2:], min_logvar)
+        )
         vars = torch.exp(-logvars)
         mean_arr = means.detach().cpu().numpy()
         var_arr = vars.detach().cpu().numpy()
@@ -153,7 +140,7 @@ def step_agents(
                 means, vars, logvars, device_actions,
             )
             loss.backward()
-        step = (sensors, actions, carries)
+        step = (current_sensor, actions)
         steps.append(step)
         box = actions.numpy()
         obs, _, terminated, _, _ = envs[i].step(box)
@@ -172,7 +159,7 @@ def step_agents(
                     else:
                         before.add_(grad)
 
-    factor = 0.1 * 1.0 / len(agents)
+    factor = 0.9 * 1.0 / len(agents)
     # penalize agent for doing the same as mean agent
     # by removing the
     for agent in agents:
@@ -220,18 +207,19 @@ def reset_in_place(env: BipedalWalker):
 
 def walkers(headless: bool, show_training: bool):
     rng = np.random.default_rng()
-    population = 50
+    population = 100
     envs = [BipedalWalker("rgb_array") for _ in range(population)]
-    history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
+    history: list[list[tuple[Tensor, Tensor]]] = [[] for _ in envs]
     n_sensors = 24
     n_motors = 4 * 2
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    max_history = 50
     agents = [
-        create_agent(n_sensors, n_motors, 10, 10, device, lr=0.1)
+        create_agent(n_sensors, n_motors, device, max_len=max_history+1, lr=0.1)
         for _ in envs
     ]
-    max_history = 1
     min_logvar = torch.scalar_tensor(2.0*log(0.01), device=device)
+    max_logvar = torch.scalar_tensor(2.0*log(100.0), device=device)
     observations = [env.reset()[0] for env in envs]
     width, height = 600, 400
     life_rate = 0.0
@@ -259,14 +247,13 @@ def walkers(headless: bool, show_training: bool):
         with (renders / f'walker-{now}-training.log').open("w") as logfile:
             bar = tqdm(range(training_steps), ncols=90)
             for _ in bar:
-                agent_motors = predict_motors(observations, agents, device)
-                if device.type == 'cuda':
-                    torch.cuda.synchronize()
                 alpha = 0.999
                 alives, steps = step_agents(
-                    rng, agent_motors, agents, envs, observations,
+                    rng, history, agents, envs, observations,
                     train_agents=True,
+                    device=device,
                     min_logvar=min_logvar,
+                    max_logvar=max_logvar,
                 )
                 for i, step in enumerate(steps):
                     history[i].append(step)
@@ -282,11 +269,11 @@ def walkers(headless: bool, show_training: bool):
                 # for bad in worst[:chaff]:
                 #     alives[bad] = False
                 replicate_agents(rng, alives, envs, agents, history)
-                # randomly reset one agent to standing position every frame
-                if rng.uniform() < 0.01 * len(envs):
-                    to_reset = rng.choice(len(envs), size=1)[0]
-                    alives[to_reset] = True
-                    reset_in_place(envs[to_reset])
+                # # randomly reset one agent to standing position every frame
+                # if rng.uniform() < 0.01 * len(envs):
+                #     to_reset = rng.choice(len(envs), size=1)[0]
+                #     alives[to_reset] = True
+                #     reset_in_place(envs[to_reset])
                 life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
                 expected_life = 1.0 / (1.0 - life_rate)
                 bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
@@ -305,8 +292,11 @@ def walkers(headless: bool, show_training: bool):
     except KeyboardInterrupt:
         pass
 
-    observations = [env.reset()[0] for env in envs[:to_render]]
-    frames = [get_frame(env) for env in envs[:to_render]]
+    envs = envs[:to_render]
+    agents = agents[:to_render]
+    history = [[] for _ in range(to_render)]
+    observations = [env.reset()[0] for env in envs]
+    frames = [get_frame(env) for env in envs]
     image = overlay_frames(frames, to_render)
     output_path = renders / f'walker-{now}.mkv'
     writer: Popen = (
@@ -326,23 +316,25 @@ def walkers(headless: bool, show_training: bool):
         plt.show(block=False)
     else:
         img = None
-    for _ in itertools.count():
-        with torch.no_grad():
-            agent_motors = predict_motors(observations, agents[:to_render], device)
+    four_minutes = 25*60*4
+    for _ in range(four_minutes):
         with torch.no_grad():
             alives, _ = step_agents(
-                rng, agent_motors, agents, envs, observations, min_logvar,
+                rng, history, agents, envs, observations,
+                min_logvar=min_logvar,
+                max_logvar=max_logvar,
+                device=device,
             )
         for i, alive in enumerate(alives):
             if not alive:
                 envs[i].reset()
-        frames = [get_frame(env) for env in envs[:to_render]]
+        frames = [get_frame(env) for env in envs]
         image = overlay_frames(frames, to_render)
         if img is not None:
             xs.clear()
-            xs.hist([env.hull.position.x for env in envs[:to_render] if env.hull])
+            xs.hist([env.hull.position.x for env in envs if env.hull])
             ys.clear()
-            ys.hist([env.hull.position.y for env in envs[:to_render] if env.hull])
+            ys.hist([env.hull.position.y for env in envs if env.hull])
             img.set_data(image)
             fig.canvas.draw()
             fig.canvas.flush_events()

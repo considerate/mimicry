@@ -26,6 +26,8 @@ poles = "mimicry.cartpoles:main"
 a2c-poles = "mimicry.cartpoles:reinforcement_learning"
 walkers = "mimicry.walkers:main"
 headless-walkers = "mimicry.walkers:headless"
+transformer-walkers = "mimicry.transformer_walkers:main"
+headless-transformer-walkers = "mimicry.transformer_walkers:headless"
 
 [build-system]
 requires = ["poetry-core"]
