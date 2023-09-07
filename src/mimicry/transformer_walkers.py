@@ -233,7 +233,7 @@ def walkers(headless: bool, show_training: bool):
     now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
     renders = Path('renders')
     renders.mkdir(exist_ok=True)
-    training_steps = 10_000
+    training_steps = 100_000
     fig = plt.figure()
     assert isinstance(fig, plt.Figure)
     xs = plt.subplot(2, 2, 1)
