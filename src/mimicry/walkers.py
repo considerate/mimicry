@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import itertools
 from math import log
 from subprocess import Popen
@@ -17,7 +18,7 @@ from mimicry.data import Carries
 from tqdm import tqdm
 
 # from mimicry.network import Agent, create_agent, train
-from mimicry.feedforward import create_agent
+from mimicry.feedforward import Agent, create_agent
 from mimicry.mimicry import copy_carries, replicate_params
 
 
@@ -99,7 +100,7 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
                 replicate_joint(joint, envs[i].joints[j])
             for j, leg in enumerate(envs[k].legs):
                 replicate_leg(leg, envs[i].legs[j])
-                envs[i].legs[j].ground_contact = False
+                envs[i].legs[j].ground_contact = False # type: ignore
             envs[i].scroll = envs[k].scroll
             envs[i].game_over = envs[k].game_over
             envs[i].lidar_render = envs[k].lidar_render
@@ -124,7 +125,7 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
 def step_agents(
     rng: np.random.Generator,
     agent_motors,
-    agents,
+    agents: Sequence[Agent],
     envs,
     observations,
     min_logvar,
@@ -154,13 +155,38 @@ def step_agents(
                 means, vars, logvars, device_actions, min_logvar
             )
             loss.backward()
-            agent.optimiser.step()
         step = (sensors, actions, carries)
         steps.append(step)
         box = actions.numpy()
         obs, _, terminated, _, _ = envs[i].step(box)
         observations[i] = obs
         alives.append(not terminated)
+    # compute summed gradient for each parameter
+    grad_accum: dict[str, torch.Tensor] = {}
+    if train_agents:
+        for agent in agents:
+            for name, param in agent.model.named_parameters():
+                grad = param.grad
+                if grad is not None:
+                    before = grad_accum.get(name)
+                    if before is None:
+                        grad_accum[name] = grad
+                    else:
+                        before.add_(grad)
+
+    factor = 1.0 / len(agents)
+    # penalize agent for doing the same as mean agent
+    # by removing the
+    for agent in agents:
+        if train_agents:
+            for name, param in agent.model.named_parameters():
+                grad = param.grad
+                if grad is None:
+                    continue
+                accum = grad_accum.get(name)
+                if accum is not None:
+                    grad.sub_(accum, alpha=factor)
+            agent.optimiser.step()
     return alives, steps
 
 def get_frame(env: gymnasium.Env) -> npt.NDArray[np.uint8]:
@@ -180,9 +206,23 @@ def overlay_frames(frames: list[npt.NDArray[np.uint8]], to_render: int):
             + frame[ys,xs,:] * (1.0 / to_render)
     return image
 
+def reset_in_place(env: BipedalWalker):
+    scroll = env.scroll
+    hull = env.hull
+    assert hull is not None
+    x = hull.position.x
+    env.reset()
+    env.scroll = scroll
+    hull = env.hull
+    assert hull is not None
+    diff = x - hull.position.x
+    hull.position.x += diff
+    for leg in env.legs:
+        leg.position.x += diff
+
 def walkers(headless: bool, show_training: bool):
     rng = np.random.default_rng()
-    population = 30
+    population = 50
     envs = [BipedalWalker("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, int, Carries]]] = [[] for _ in envs]
     n_sensors = 24
@@ -201,14 +241,13 @@ def walkers(headless: bool, show_training: bool):
     now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
     renders = Path('renders')
     renders.mkdir(exist_ok=True)
-    training_steps = 100_000
+    training_steps = 10_000
     fig = plt.figure()
     assert isinstance(fig, plt.Figure)
     xs = plt.subplot(2, 2, 1)
     ys = plt.subplot(2, 2, 2)
     ax = plt.subplot(2, 1, 2)
     to_render = 5
-    histogram = None
     if not headless and show_training:
         frames = [get_frame(env) for env in envs[:to_render]]
         image = overlay_frames(frames, to_render)
@@ -221,7 +260,7 @@ def walkers(headless: bool, show_training: bool):
     try:
         with (renders / f'walker-{now}-training.log').open("w") as logfile:
             bar = tqdm(range(training_steps), ncols=90)
-            for iteration in bar:
+            for _ in bar:
                 agent_motors = predict_motors(observations, agents, device)
                 if device.type == 'cuda':
                     torch.cuda.synchronize()
@@ -231,16 +270,25 @@ def walkers(headless: bool, show_training: bool):
                     train_agents=True,
                     min_logvar=min_logvar,
                 )
-                # kill the worst agent every frame
-                worst = np.argmin([env.scroll for env in envs])
-                alives[worst] = False
-                worst = np.argmin([env.hull.position.y for env in envs if env.hull])
-                alives[worst] = False
+                # kill the worst agents every frame
+                # decile = len(envs) // 10 + 1
+                chaff = 5
+                worst = np.argsort([env.scroll for env in envs])
+                for bad in worst[:chaff]:
+                    alives[bad] = False
+                worst = np.argsort([env.hull.position.y for env in envs if env.hull])
+                for bad in worst[:chaff]:
+                    alives[bad] = False
                 for i, step in enumerate(steps):
                     history[i].append(step)
                     if len(history[i]) > max_history:
                         history[i].pop(0)
                 replicate_agents(rng, alives, envs, agents, history)
+                # randomly reset one agent to standing position every frame
+                if rng.uniform() < 0.01 * len(envs):
+                    to_reset = rng.choice(len(envs), size=1)[0]
+                    alives[to_reset] = True
+                    reset_in_place(envs[to_reset])
                 life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
                 expected_life = 1.0 / (1.0 - life_rate)
                 bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
@@ -280,7 +328,7 @@ def walkers(headless: bool, show_training: bool):
         plt.show(block=False)
     else:
         img = None
-    for iteration in itertools.count():
+    for _ in itertools.count():
         with torch.no_grad():
             agent_motors = predict_motors(observations, agents[:to_render], device)
         with torch.no_grad():
