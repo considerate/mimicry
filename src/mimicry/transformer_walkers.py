@@ -211,6 +211,28 @@ def write_json_record(record: dict[str, Any], file) -> None:
     json.dump(record, file)
     file.write("\n")
 
+def dump_agents(agents: list[Agent], directory: Path) -> None:
+    directory.mkdir(exist_ok=True)
+    for i, agent in enumerate(agents):
+        torch.save(
+            agent.model.state_dict(),
+            directory / f"agent-{i}-model.pt",
+        )
+        torch.save(
+            agent.optimiser.state_dict(),
+            directory / f"agent-{i}-optimiser.pt",
+        )
+def prune_chaff(envs: list[BipedalWalker], alives: list[bool], chaff: int):
+    """
+    kill the worst agents every frame
+    """
+    worst = np.argsort([env.scroll for env in envs])
+    for bad in worst[:chaff]:
+        alives[bad] = False
+    worst = np.argsort([env.hull.position.y for env in envs if env.hull])
+    for bad in worst[:chaff]:
+        alives[bad] = False
+
 def walkers(headless: bool, show_training: bool):
     rng = np.random.default_rng()
     population = 100
@@ -220,6 +242,7 @@ def walkers(headless: bool, show_training: bool):
     n_motors = 4 * 2
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     max_history = 50
+    checkpoint_interval = 1000
     agents = [
         create_agent(n_sensors, n_motors, device, max_len=max_history+1, lr=0.1)
         for _ in envs
@@ -232,7 +255,11 @@ def walkers(headless: bool, show_training: bool):
 
     now = datetime.now().strftime('%Y-%m-%dT%H%M%S')
     renders = Path('renders')
+    checkpoints = Path('checkpoints')
     renders.mkdir(exist_ok=True)
+    checkpoints.mkdir(exist_ok=True)
+    checkpoint_dir = checkpoints / f"walker-{now}"
+    checkpoint_dir.mkdir()
     training_steps = 100_000
     fig = plt.figure()
     assert isinstance(fig, plt.Figure)
@@ -249,13 +276,17 @@ def walkers(headless: bool, show_training: bool):
         plt.show(block=False)
     else:
         img = None
+    iteration = 0
     try:
         with (
             (renders / f'walker-{now}-training.log').open("w") as logfile,
             (renders / f'walker-{now}-training.json-seq').open("a") as jsonlog,
         ):
             bar = tqdm(range(training_steps), ncols=90)
-            for _ in bar:
+            for it in bar:
+                iteration = it
+                if iteration % checkpoint_interval == 0:
+                    dump_agents(agents, checkpoint_dir / f"{iteration}")
                 alpha = 0.999
                 alives, steps = step_agents(
                     rng, history, agents, envs, observations,
@@ -268,21 +299,14 @@ def walkers(headless: bool, show_training: bool):
                     history[i].append(step)
                     if len(history[i]) > max_history:
                         history[i].pop(0)
-                # kill the worst agents every frame
-                # decile = len(envs) // 10 + 1
-                # chaff = 5
-                # worst = np.argsort([env.scroll for env in envs])
-                # for bad in worst[:chaff]:
-                #     alives[bad] = False
-                # worst = np.argsort([env.hull.position.y for env in envs if env.hull])
-                # for bad in worst[:chaff]:
-                #     alives[bad] = False
+                prune_chaff(envs, alives, chaff=3)
                 replicate_agents(rng, alives, envs, agents, history)
-                # # randomly reset one agent to standing position every frame
-                # if rng.uniform() < 0.01 * len(envs):
-                #     to_reset = rng.choice(len(envs), size=1)[0]
-                #     alives[to_reset] = True
-                #     reset_in_place(envs[to_reset])
+                # randomly reset one agent to standing position with 1%
+                # probability per agent
+                if rng.uniform() < 0.01 * len(envs):
+                    to_reset = rng.choice(len(envs), size=1)[0]
+                    alives[to_reset] = False
+                    reset_in_place(envs[to_reset])
                 life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
                 expected_life = 1.0 / (1.0 - life_rate)
                 bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
@@ -312,6 +336,7 @@ def walkers(headless: bool, show_training: bool):
                     fig.canvas.flush_events()
     except KeyboardInterrupt:
         pass
+    dump_agents(agents, checkpoint_dir / f"stopped-{iteration}")
 
     envs = envs[:to_render]
     agents = agents[:to_render]
