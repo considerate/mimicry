@@ -6,6 +6,7 @@ from typing import Any
 from Box2D import b2Body, b2RevoluteJoint
 from gymnasium.envs.box2d.bipedal_walker import BipedalWalker
 import gymnasium
+import argparse
 
 import matplotlib.pyplot as plt
 import ffmpeg
@@ -222,20 +223,27 @@ def dump_agents(agents: list[Agent], directory: Path) -> None:
             agent.optimiser.state_dict(),
             directory / f"agent-{i}-optimiser.pt",
         )
-def prune_chaff(envs: list[BipedalWalker], alives: list[bool], chaff: int):
+def prune_chaff_x(envs: list[BipedalWalker], alives: list[bool], chaff: int):
     """
     kill the worst agents every frame
     """
     worst = np.argsort([env.scroll for env in envs])
     for bad in worst[:chaff]:
         alives[bad] = False
+
+def prune_chaff_y(envs: list[BipedalWalker], alives: list[bool], chaff: int):
     worst = np.argsort([env.hull.position.y for env in envs if env.hull])
     for bad in worst[:chaff]:
         alives[bad] = False
 
-def walkers(headless: bool, show_training: bool):
+def walkers(
+    headless: bool,
+    show_training: bool,
+    population: int = 100,
+    training_steps:int = 100_000,
+    resume: Path | None = None,
+):
     rng = np.random.default_rng()
-    population = 100
     envs = [BipedalWalker("rgb_array") for _ in range(population)]
     history: list[list[tuple[Tensor, Tensor]]] = [[] for _ in envs]
     n_sensors = 24
@@ -247,6 +255,12 @@ def walkers(headless: bool, show_training: bool):
         create_agent(n_sensors, n_motors, device, max_len=max_history+1, lr=0.1)
         for _ in envs
     ]
+    if resume is not None:
+        for i, agent in enumerate(agents):
+            model_state = torch.load(resume / f"agent-{i}-model.pt")
+            agent.model.load_state_dict(model_state)
+            optim_state = torch.load(resume / f"agent-{i}-optimiser.pt")
+            agent.optimiser.load_state_dict(optim_state)
     min_logvar = torch.scalar_tensor(2.0*log(0.01), device=device)
     max_logvar = torch.scalar_tensor(2.0*log(100.0), device=device)
     observations = [env.reset()[0] for env in envs]
@@ -260,7 +274,6 @@ def walkers(headless: bool, show_training: bool):
     checkpoints.mkdir(exist_ok=True)
     checkpoint_dir = checkpoints / f"walker-{now}"
     checkpoint_dir.mkdir()
-    training_steps = 100_000
     fig = plt.figure()
     assert isinstance(fig, plt.Figure)
     xs = plt.subplot(2, 2, 1)
@@ -299,7 +312,7 @@ def walkers(headless: bool, show_training: bool):
                     history[i].append(step)
                     if len(history[i]) > max_history:
                         history[i].pop(0)
-                prune_chaff(envs, alives, chaff=3)
+                prune_chaff_x(envs, alives, chaff=3)
                 replicate_agents(rng, alives, envs, agents, history)
                 # randomly reset one agent to standing position with 1%
                 # probability per agent
@@ -390,4 +403,17 @@ def headless():
     walkers(True, False)
 
 def main():
-    walkers(False, True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--train", type=int)
+    parser.add_argument("--population", type=int)
+    args = parser.parse_args()
+    headless = args.headless
+    show_training = not headless
+    arguments: dict[str, Any] = {}
+    if args.train is not None:
+        arguments["training_steps"] = args.train
+    if args.population is not None:
+        arguments["population"] = args.population
+    walkers(headless, show_training, resume=args.resume, **arguments)
