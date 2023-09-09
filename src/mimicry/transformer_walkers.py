@@ -4,7 +4,7 @@ from math import log
 from subprocess import Popen
 from typing import Any
 from Box2D import b2Body, b2RevoluteJoint
-from gymnasium.envs.box2d.bipedal_walker import BipedalWalker
+from gymnasium.envs.box2d.bipedal_walker import TERRAIN_GRASS, TERRAIN_LENGTH, TERRAIN_STEP, BipedalWalker
 import gymnasium
 import argparse
 
@@ -107,7 +107,7 @@ def step_agents(
     max_logvar,
     device,
     train_agents=False
-) -> tuple[list[bool], list[tuple[Tensor, Tensor]]]:
+) -> tuple[list[bool], list[tuple[Tensor, Tensor, npt.NDArray[np.float32]]]]:
     alives = []
     steps = []
     one = torch.scalar_tensor(1.0,dtype=torch.float32).to(device)
@@ -142,12 +142,20 @@ def step_agents(
                 means, vars, logvars, device_actions,
             )
             loss.backward()
-        step = (current_sensor, actions)
-        steps.append(step)
         box = actions.numpy()
         obs, _, terminated, _, _ = envs[i].step(box)
-        alives.append(not terminated)
-        observations[i] = obs
+        alive = not terminated
+        if terminated:
+            env = envs[i]
+            hull = env.hull
+            histories[i].clear()
+            if hull:
+                if hull.position.x > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
+                    alive = True
+                    obs, _ = env.reset()
+        step = (current_sensor, actions, obs)
+        steps.append(step)
+        alives.append(alive)
     # compute summed gradient for each parameter
     grad_accum: dict[str, torch.Tensor] = {}
     if train_agents:
@@ -308,8 +316,9 @@ def walkers(
                     min_logvar=min_logvar,
                     max_logvar=max_logvar,
                 )
-                for i, step in enumerate(steps):
-                    history[i].append(step)
+                for i, (sensors, actions, obs)  in enumerate(steps):
+                    observations[i] = obs
+                    history[i].append((sensors, actions))
                     if len(history[i]) > max_history:
                         history[i].pop(0)
                 prune_chaff_x(envs, alives, chaff=3)
