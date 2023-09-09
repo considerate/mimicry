@@ -61,7 +61,7 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
     n = len(alives)
     if not any(alives):
         for i, env in enumerate(envs):
-            env.reset()
+            env.reset(seed=1234)
             history[i].clear()
     else:
         for i in range(n):
@@ -70,7 +70,7 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
             k = i
             while not alives[k]:
                 k = (k - 1) % n if rng.random() < 0.5 else (k + 1) % n
-            envs[i].reset()
+            envs[i].reset(seed=1234)
             for j, joint in enumerate(envs[k].joints):
                 replicate_joint(joint, envs[i].joints[j])
             for j, leg in enumerate(envs[k].legs):
@@ -152,8 +152,8 @@ def step_agents(
             if hull:
                 if hull.position.x > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
                     alive = True
-                    obs, _ = env.reset()
-        step = (current_sensor, actions, obs)
+                    obs, _ = env.reset(seed=1234)
+        step = (current_sensor, motors, obs)
         steps.append(step)
         alives.append(alive)
     # compute summed gradient for each parameter
@@ -201,12 +201,12 @@ def overlay_frames(frames: list[npt.NDArray[np.uint8]], to_render: int):
             + frame[ys,xs,:] * (1.0 / to_render)
     return image
 
-def reset_in_place(env: BipedalWalker):
+def reset_in_place(env: BipedalWalker) -> npt.NDArray[np.float32]:
     scroll = env.scroll
     hull = env.hull
     assert hull is not None
     x = hull.position.x
-    env.reset()
+    obs, _ = env.reset(seed=1234)
     env.scroll = scroll
     hull = env.hull
     assert hull is not None
@@ -214,6 +214,7 @@ def reset_in_place(env: BipedalWalker):
     hull.position.x += diff
     for leg in env.legs:
         leg.position.x += diff
+    return obs
 
 def write_json_record(record: dict[str, Any], file) -> None:
     file.write("\x1e")
@@ -235,7 +236,7 @@ def prune_chaff_x(envs: list[BipedalWalker], alives: list[bool], chaff: int):
     """
     kill the worst agents every frame
     """
-    worst = np.argsort([env.scroll for env in envs])
+    worst = np.argsort([env.hull.position.x for env in envs if env.hull])
     for bad in worst[:chaff]:
         alives[bad] = False
 
@@ -271,7 +272,7 @@ def walkers(
             agent.optimiser.load_state_dict(optim_state)
     min_logvar = torch.scalar_tensor(2.0*log(0.01), device=device)
     max_logvar = torch.scalar_tensor(2.0*log(100.0), device=device)
-    observations = [env.reset()[0] for env in envs]
+    observations = [env.reset(seed=1234)[0] for env in envs]
     width, height = 600, 400
     life_rate = 0.0
 
@@ -316,19 +317,21 @@ def walkers(
                     min_logvar=min_logvar,
                     max_logvar=max_logvar,
                 )
-                for i, (sensors, actions, obs)  in enumerate(steps):
+                for i, (sensors, motors, obs)  in enumerate(steps):
                     observations[i] = obs
-                    history[i].append((sensors, actions))
+                    history[i].append((sensors, motors))
                     if len(history[i]) > max_history:
                         history[i].pop(0)
-                prune_chaff_x(envs, alives, chaff=3)
+                if rng.random() < 0.05:
+                    prune_chaff_x(envs, alives, chaff=3)
                 replicate_agents(rng, alives, envs, agents, history)
                 # randomly reset one agent to standing position with 1%
                 # probability per agent
-                if rng.uniform() < 0.01 * len(envs):
-                    to_reset = rng.choice(len(envs), size=1)[0]
-                    alives[to_reset] = False
-                    reset_in_place(envs[to_reset])
+                # if rng.uniform() < 0.01 * len(envs):
+                #     to_reset = rng.choice(len(envs), size=1)[0]
+                #     alives[to_reset] = False
+                #     history[to_reset].clear()
+                #     observations[to_reset] = reset_in_place(envs[to_reset])
                 life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
                 expected_life = 1.0 / (1.0 - life_rate)
                 bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
@@ -363,7 +366,7 @@ def walkers(
     envs = envs[:to_render]
     agents = agents[:to_render]
     history = [[] for _ in range(to_render)]
-    observations = [env.reset()[0] for env in envs]
+    observations = [env.reset(seed=1234)[0] for env in envs]
     frames = [get_frame(env) for env in envs]
     image = overlay_frames(frames, to_render)
     output_path = renders / f'walker-{now}.mkv'
@@ -395,7 +398,7 @@ def walkers(
             )
         for i, alive in enumerate(alives):
             if not alive:
-                envs[i].reset()
+                envs[i].reset(seed=1234)
         frames = [get_frame(env) for env in envs]
         image = overlay_frames(frames, to_render)
         if img is not None:
