@@ -122,25 +122,28 @@ def step_agents(
         if train_agents:
             agent.optimiser.zero_grad()
 
-        motors = motors_sequence[-1,0,:]
-        n_motors = len(motors)
-        means = torch.clip(motors[0:n_motors//2], -one, one)
+        _, _, n_motors = motors_sequence.shape
+        means = torch.clip(motors_sequence[:,0,0:n_motors//2], -one, one)
         logvars = torch.minimum(
             max_logvar,
-            torch.maximum(motors[n_motors//2:], min_logvar)
+            torch.maximum(motors_sequence[:,0,n_motors//2:], min_logvar)
         )
         vars = torch.exp(-logvars)
-        mean_arr = means.detach().cpu().numpy()
-        var_arr = vars.detach().cpu().numpy()
+        mean_arr = means[-1,:].detach().cpu().numpy()
+        var_arr = vars[-1,:].detach().cpu().numpy()
         actions = torch.tensor([
             np.clip(rng.normal(mean, np.sqrt(var)), -1.0, 1.0)
             for (mean, var) in zip(mean_arr, var_arr, strict=True)
         ])
+        device_actions = actions.to(means.device)
         if train_agents:
-            device_actions = actions.to(means.device)
             loss = gaussian_log_negative_log_loss(
-                means, vars, logvars, device_actions,
+                means[-1,:], vars[-1,:], logvars[-1,:], device_actions,
             )
+            for t, (_, act) in enumerate(history):
+                loss += gaussian_log_negative_log_loss(
+                    means[t,:], vars[t,:], logvars[t,:], act,
+                )
             loss.backward()
         box = actions.numpy()
         obs, _, terminated, _, _ = envs[i].step(box)
@@ -153,7 +156,7 @@ def step_agents(
                 if hull.position.x > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
                     alive = True
                     obs, _ = env.reset(seed=1234)
-        step = (current_sensor, motors, obs)
+        step = (current_sensor, device_actions, obs)
         steps.append(step)
         alives.append(alive)
     # compute summed gradient for each parameter
