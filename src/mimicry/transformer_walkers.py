@@ -99,6 +99,7 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
 
 def step_agents(
     rng: np.random.Generator,
+    iteration: int,
     histories: list[list[tuple[Tensor, Tensor]]],
     agents: Sequence[Agent],
     envs,
@@ -135,15 +136,16 @@ def step_agents(
             np.clip(rng.normal(mean, np.sqrt(var)), -1.0, 1.0)
             for (mean, var) in zip(mean_arr, var_arr, strict=True)
         ])
-        device_actions = actions.to(means.device)
+        device_actions = actions.to(means.device).detach()
         if train_agents:
             loss = gaussian_log_negative_log_loss(
                 means[-1,:], vars[-1,:], logvars[-1,:], device_actions,
             )
-            for t, (_, act) in enumerate(history):
-                loss += gaussian_log_negative_log_loss(
-                    means[t,:], vars[t,:], logvars[t,:], act,
-                )
+            if (i + iteration) % 10 ==  0:
+                for t, (_, act) in enumerate(history):
+                    loss += gaussian_log_negative_log_loss(
+                        means[t,:], vars[t,:], logvars[t,:], act,
+                    )
             loss.backward()
         box = actions.numpy()
         obs, _, terminated, _, _ = envs[i].step(box)
@@ -314,7 +316,9 @@ def walkers(
                     dump_agents(agents, checkpoint_dir / f"{iteration}")
                 alpha = 0.999
                 alives, steps = step_agents(
-                    rng, history, agents, envs, observations,
+                    rng,
+                    iteration,
+                    history, agents, envs, observations,
                     train_agents=True,
                     device=device,
                     min_logvar=min_logvar,
@@ -391,10 +395,12 @@ def walkers(
     else:
         img = None
     four_minutes = 25*60*4
-    for _ in range(four_minutes):
+    for iteration in range(four_minutes):
         with torch.no_grad():
             alives, _ = step_agents(
-                rng, history, agents, envs, observations,
+                rng,
+                iteration,
+                history, agents, envs, observations,
                 min_logvar=min_logvar,
                 max_logvar=max_logvar,
                 device=device,
