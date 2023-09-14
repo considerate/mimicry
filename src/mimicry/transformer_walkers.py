@@ -124,36 +124,41 @@ def step_agents(
             agent.optimiser.zero_grad()
 
         _, _, n_motors = motors_sequence.shape
-        means = torch.tanh(motors_sequence[:,0,0:n_motors//2]) * 2.0
-        logvars = torch.minimum(
-            torch.maximum(motors_sequence[:,0,n_motors//2:], min_logvar),
-            max_logvar,
-        )
-        vars = torch.exp(logvars)
-        mean = means[-1,:].detach()
-        std = torch.sqrt(vars[-1,:]).detach()
-        device_actions = torch.normal(mean = mean, std = std)
-        device_actions = device_actions.detach()
-        if train_agents:
-            loss = loss_fn(device_actions, means[-1,:], vars[-1,:])
-            if (i + iteration) % 10 ==  0:
-                for t, (_, act) in enumerate(history):
-                    loss = loss + loss_fn(act, means[t,:], vars[t,:])
-            loss.backward()
-        box = torch.tanh(device_actions).cpu().numpy()
-        obs, reward, terminated, _, _ = envs[i].step(box)
-        alive = not terminated
-        if terminated:
-            env = envs[i]
-            hull = env.hull
-            histories[i].clear()
-            if hull:
-                if hull.position.x > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
-                    alive = True
-                    obs, _ = env.reset(seed=1234)
-        step = (current_sensor, device_actions, obs, reward)
-        steps.append(step)
-        alives.append(alive)
+        if torch.any(torch.isnan(motors_sequence)):
+            step = (current_sensor, None, None, None)
+            steps.append(step)
+            alives.append(False)
+        else:
+            means = torch.tanh(motors_sequence[:,0,0:n_motors//2]) * 2.0
+            logvars = torch.minimum(
+                torch.maximum(motors_sequence[:,0,n_motors//2:], min_logvar),
+                max_logvar,
+            )
+            vars = torch.exp(logvars)
+            mean = means[-1,:].detach()
+            std = torch.sqrt(vars[-1,:]).detach()
+            device_actions = torch.normal(mean = mean, std = std)
+            device_actions = device_actions.detach()
+            if train_agents:
+                loss = loss_fn(device_actions, means[-1,:], vars[-1,:])
+                if (i + iteration) % 10 ==  0:
+                    for t, (_, act) in enumerate(history):
+                        loss = loss + loss_fn(act, means[t,:], vars[t,:])
+                loss.backward()
+            box = torch.tanh(device_actions).cpu().numpy()
+            obs, reward, terminated, _, _ = envs[i].step(box)
+            alive = not terminated
+            if terminated:
+                env = envs[i]
+                hull = env.hull
+                histories[i].clear()
+                if hull:
+                    if hull.position.x > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
+                        alive = True
+                        obs, _ = env.reset(seed=1234)
+            step = (current_sensor, device_actions, obs, reward)
+            steps.append(step)
+            alives.append(alive)
     # compute summed gradient for each parameter
     grad_accum: dict[str, torch.Tensor] = {}
     if train_agents:
