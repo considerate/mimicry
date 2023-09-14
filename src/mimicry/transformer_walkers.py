@@ -98,20 +98,20 @@ def replicate_agents(rng, alives, envs: list[BipedalWalker], agents, history):
 
 
 def step_agents(
-    rng: np.random.Generator,
     iteration: int,
     histories: list[list[tuple[Tensor, Tensor]]],
     agents: Sequence[Agent],
     envs,
     observations,
     min_logvar,
-    max_logvar,
     device,
     train_agents=False
-) -> tuple[list[bool], list[tuple[Tensor, Tensor, npt.NDArray[np.float32]]]]:
+) -> tuple[list[bool], list[tuple[Tensor, Tensor, npt.NDArray[np.float32], float]]]:
+    np.printoptions(precision=4, suppress=True, threshold=5)
     alives = []
     steps = []
-    one = torch.scalar_tensor(1.0,dtype=torch.float32).to(device)
+    max_logvar = torch.scalar_tensor(15.0, device=device)
+    loss_fn = torch.nn.GaussianNLLLoss()
     for i, history in enumerate(histories):
         agent = agents[i]
         current_sensor = torch.from_numpy(observations[i]).to(device)
@@ -124,31 +124,24 @@ def step_agents(
             agent.optimiser.zero_grad()
 
         _, _, n_motors = motors_sequence.shape
-        means = torch.clip(motors_sequence[:,0,0:n_motors//2], -one, one)
+        means = torch.tanh(motors_sequence[:,0,0:n_motors//2]) * 2.0
         logvars = torch.minimum(
+            torch.maximum(motors_sequence[:,0,n_motors//2:], min_logvar),
             max_logvar,
-            torch.maximum(motors_sequence[:,0,n_motors//2:], min_logvar)
         )
-        vars = torch.exp(-logvars)
-        mean_arr = means[-1,:].detach().cpu().numpy()
-        var_arr = vars[-1,:].detach().cpu().numpy()
-        actions = torch.tensor([
-            np.clip(rng.normal(mean, np.sqrt(var)), -1.0, 1.0)
-            for (mean, var) in zip(mean_arr, var_arr, strict=True)
-        ])
-        device_actions = actions.to(means.device).detach()
+        vars = torch.exp(logvars)
+        mean = means[-1,:].detach()
+        std = torch.sqrt(vars[-1,:]).detach()
+        device_actions = torch.normal(mean = mean, std = std)
+        device_actions = device_actions.detach()
         if train_agents:
-            loss = gaussian_log_negative_log_loss(
-                means[-1,:], vars[-1,:], logvars[-1,:], device_actions,
-            )
+            loss = loss_fn(device_actions, means[-1,:], vars[-1,:])
             if (i + iteration) % 10 ==  0:
                 for t, (_, act) in enumerate(history):
-                    loss += gaussian_log_negative_log_loss(
-                        means[t,:], vars[t,:], logvars[t,:], act,
-                    )
+                    loss = loss + loss_fn(act, means[t,:], vars[t,:])
             loss.backward()
-        box = actions.numpy()
-        obs, _, terminated, _, _ = envs[i].step(box)
+        box = torch.tanh(device_actions).cpu().numpy()
+        obs, reward, terminated, _, _ = envs[i].step(box)
         alive = not terminated
         if terminated:
             env = envs[i]
@@ -158,7 +151,7 @@ def step_agents(
                 if hull.position.x > (TERRAIN_LENGTH - TERRAIN_GRASS) * TERRAIN_STEP:
                     alive = True
                     obs, _ = env.reset(seed=1234)
-        step = (current_sensor, device_actions, obs)
+        step = (current_sensor, device_actions, obs, reward)
         steps.append(step)
         alives.append(alive)
     # compute summed gradient for each parameter
@@ -174,7 +167,7 @@ def step_agents(
                     else:
                         before.add_(grad)
 
-    factor = 0.9 * 1.0 / len(agents)
+    factor = 0.1 * 1.0 / len(agents)
     # penalize agent for doing the same as mean agent
     # by removing the
     for agent in agents:
@@ -276,7 +269,6 @@ def walkers(
             optim_state = torch.load(resume / f"agent-{i}-optimiser.pt")
             agent.optimiser.load_state_dict(optim_state)
     min_logvar = torch.scalar_tensor(2.0*log(0.01), device=device)
-    max_logvar = torch.scalar_tensor(2.0*log(100.0), device=device)
     observations = [env.reset(seed=1234)[0] for env in envs]
     width, height = 600, 400
     life_rate = 0.0
@@ -304,33 +296,36 @@ def walkers(
     else:
         img = None
     iteration = 0
+    reward = None
     try:
         with (
             (renders / f'walker-{now}-training.log').open("w") as logfile,
             (renders / f'walker-{now}-training.json-seq').open("a") as jsonlog,
         ):
-            bar = tqdm(range(training_steps), ncols=90)
+            bar = tqdm(range(training_steps), ncols=100)
             for it in bar:
                 iteration = it
                 if iteration % checkpoint_interval == 0:
                     dump_agents(agents, checkpoint_dir / f"{iteration}")
                 alpha = 0.999
                 alives, steps = step_agents(
-                    rng,
                     iteration,
                     history, agents, envs, observations,
                     train_agents=True,
                     device=device,
                     min_logvar=min_logvar,
-                    max_logvar=max_logvar,
                 )
-                for i, (sensors, motors, obs)  in enumerate(steps):
+                mean_reward = np.mean([r for (_, _, _, r) in steps])
+                if reward is None:
+                    reward = mean_reward
+                reward = reward * alpha + (1 - alpha) * mean_reward
+                for i, (sensors, motors, obs, _)  in enumerate(steps):
                     observations[i] = obs
                     history[i].append((sensors, motors))
                     if len(history[i]) > max_history:
                         history[i].pop(0)
                 if rng.random() < 0.05:
-                    prune_chaff_x(envs, alives, chaff=3)
+                    prune_chaff_x(envs, alives, chaff=population // 10 + 1)
                 replicate_agents(rng, alives, envs, agents, history)
                 # randomly reset one agent to standing position with 1%
                 # probability per agent
@@ -341,14 +336,25 @@ def walkers(
                 #     observations[to_reset] = reset_in_place(envs[to_reset])
                 life_rate = life_rate * alpha + (1.0 - alpha) * np.mean(alives)
                 expected_life = 1.0 / (1.0 - life_rate)
-                bar.set_postfix({"life_rate": life_rate, "mean_life": expected_life})
+                bar.set_postfix({
+                    "life_rate": life_rate,
+                    "mean_life": expected_life,
+                    "reward": reward,
+                })
                 print(life_rate, file=logfile, flush=True)
                 write_json_record({
                     "life_rate": life_rate,
                     "alives": alives,
+                    "rewards": [r for (_, _, _, r) in steps],
                     "hulls": [
-                        {"pos": {"x": env.hull.position.x, "y": env.hull.position.y},
-                         "vel": {"x": env.hull.linearVelocity.x, "y": env.hull.linearVelocity.y},
+                        {"pos": {
+                            "x": env.hull.position.x,
+                            "y": env.hull.position.y,
+                         },
+                         "vel": {
+                             "x": env.hull.linearVelocity.x,
+                             "y": env.hull.linearVelocity.y,
+                         },
                          "ang": env.hull.angularVelocity,
                         }
                         for env in envs
@@ -398,11 +404,9 @@ def walkers(
     for iteration in range(four_minutes):
         with torch.no_grad():
             alives, _ = step_agents(
-                rng,
                 iteration,
                 history, agents, envs, observations,
                 min_logvar=min_logvar,
-                max_logvar=max_logvar,
                 device=device,
             )
         for i, alive in enumerate(alives):
