@@ -320,10 +320,6 @@ def walkers(
                     device=device,
                     min_logvar=min_logvar,
                 )
-                mean_reward = np.mean([r for (_, _, _, r) in steps])
-                if reward is None:
-                    reward = mean_reward
-                reward = reward * alpha + (1 - alpha) * mean_reward
                 for i, (sensors, motors, obs, _)  in enumerate(steps):
                     observations[i] = obs
                     history[i].append((sensors, motors))
@@ -332,6 +328,10 @@ def walkers(
                 if rng.random() < 0.05:
                     prune_chaff_x(envs, alives, chaff=population // 10 + 1)
                 replicate_agents(rng, alives, envs, agents, history)
+                mean_reward = np.mean([r for (_, _, _, r) in steps if r is not None])
+                if reward is None:
+                    reward = mean_reward
+                reward = reward * alpha + (1 - alpha) * mean_reward
                 # randomly reset one agent to standing position with 1%
                 # probability per agent
                 # if rng.uniform() < 0.01 * len(envs):
@@ -350,6 +350,7 @@ def walkers(
                 write_json_record({
                     "life_rate": life_rate,
                     "alives": alives,
+                    "mean_reward": mean_reward,
                     "rewards": [r for (_, _, _, r) in steps],
                     "hulls": [
                         {"pos": {
